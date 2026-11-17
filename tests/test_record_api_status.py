@@ -99,6 +99,29 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(result['api-status']['torch.foo'], '待适配')
         self.assertEqual(result['next_steps']['torch.foo'], 'step2')
 
+    def test_pending_repair_overrides_old_support_and_adaptation_status(self):
+        for previous in ['支持', '待适配']:
+            with self.subTest(previous=previous):
+                self.adapt.write_text(json.dumps({
+                    'task-branches': ['adapt-torch.foo', 'adapt-torch.bar'],
+                    'api-status': {'torch.foo': previous, 'torch.bar': '支持'}}), encoding='utf-8')
+                pending = dict(self.entry, next_step='step0.1', notes='修复方法命名')
+                result = self.run_status('not_run', [pending])
+                self.assertEqual(result['api-status']['torch.foo'], '补充testcase')
+                self.assertEqual(result['next_steps']['torch.foo'], 'step0.1')
+                self.assertEqual(json.loads(self.adapt.read_text())['api-status']['torch.bar'], '支持')
+
+    def test_new_attempt_can_complete_after_pending_repair(self):
+        self.run_status('pass')
+        self.run_status('not_run', [dict(self.entry, next_step='step0.1')])
+        result = self.run_status('pass', [dict(self.entry, next_step='step1', execution='pass', report='test.log')])
+        self.assertEqual(result['api-status']['torch.foo'], '支持')
+        self.assertEqual(result['next_steps']['torch.foo'], 'step4')
+
+    def test_pending_repair_does_not_hide_invalid_execution(self):
+        with self.assertRaisesRegex(ValueError, '无效execution'):
+            self.run_status('unknown', [dict(self.entry, next_step='step0.1', execution='unknown')])
+
 
 if __name__ == '__main__':
     unittest.main()

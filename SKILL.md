@@ -7,30 +7,45 @@ description: 处理 PyTorch API 的 NPU 适配与测试用例补充。当用户�
 
 ## 输入
 
-需要的信息可以直接提供，或指明从哪里读取，不要求固定的文件名或任务目录格式。
+调用方直接提供以下信息，或指明读取位置。
 
-| 信息 | 内容 |
+| 输入 | 内容 |
 |---|---|
-| 待处理 API | 一个或多个明确的 API 名称及本次任务范围 |
-| 已准备的环境 | Python 路径及必要的环境加载入口；环境版本可从环境和交接材料核对 |
-| 两份源码 | 本次 PyTorch 和 torch_npu 源码路径；明确与环境所用版本的关系，不自行替换为最新源码 |
-| API 策略表 | 数据源路径及表结构说明；读取 API 名称、适配策略、API适配分类、正名关系、对外标记及支持状态 |
-| 工作位置 | 相对路径的解析根目录、torch_npu 实际开发分支、任务结果目录及本次`adapt-information.json`路径 |
+| 待处理 API | 按任务顺序提供 API 名称，如有上游任务标识则一并保留 |
+| 任务范围 | 本次要覆盖的场景、要运行的设备和交付终点 |
+| 测试环境 | 已准备好的 Python 解释器路径，以及需要加载的环境脚本 |
+| PyTorch 源码 | 与测试环境对应的 PyTorch 源码目录 |
+| torch_npu 源码 | 本次写入测试文件的 torch_npu 源码目录 |
+| API 策略表 | SQLite 数据库路径，使用其中的 `API支持数据` 表 |
+| 开发分支 | 写入测试用例的 torch_npu 分支，默认沿用当前分支 |
+| 结果目录 | 保存本次结果和报告的目录，默认使用调用方的本次工作目录 |
+| 任务状态文件 | 可复用结果目录中已有的状态文件，供同批续跑和更新逐 API 进度 |
 
-来源说明应足以定位真实材料，不把“已准备好环境”等口头描述当作路径。已有 issue、需求细节、CI 结果、分析记录等材料按需读取。分支未单独指定时沿用传入源码的当前分支；结果目录未指定时使用调用方的本次工作目录，不写到 skill 安装目录。需要修改代码前核对分支，不自行创建或切换开发分支。
+检查以下注意事项：
 
-沿用提供的环境、源码和分支，不刷新任务名单或准备另一套环境；只处理本次 API，不扩大到整个策略表。
+1. 沿用本次提供的 Python 环境和两份源码，只查询分给本次任务的 API。
+2. 写用例前核对 torch_npu 当前分支与本次开发分支一致。
+3. 调用方未传任务状态文件时，在结果目录使用 `adapt-information.json`。首次创建时，将本批 API 按 `adapt-<API>` 写入 `task-branches[]`。续跑时复用原文件及其 `api-status`。
+4. 需要核对需求或已有验证结果时，读取对应的 issue、CI 结果或分析记录。
+5. 同批续跑复用已有用例和有效报告，逐 API 记录生成和运行状态。尚未运行记为 `not_run`，环境阻塞记为 `blocked`。
 
 ## 步骤
 
-1. [Step0：查表分流](steps/step0-testcase_check.md)。按当前API的适配策略和本批状态分流：`补充testcase`进入Step0.1，`待适配`进入Step2，`支持`或数据库策略`已支持`交Step4；其他策略按Step0说明处理。
-2. [Step0.1：生成补充用例](steps/step0.1-testcase_development.md)。读取数据库初分后调用生成 skill 生成功能用例；生成器可按职责自行修正类别，Step0.1在生成成功后按反馈回填正名行的适配分类，再交给 Step1。
-3. [Step1：运行测试并记录状态](steps/step1-testcase_validation.md)。沿用提供的环境运行功能用例，通过后写入`支持`并结束该API，交回主agent准备PR；失败后写入`待适配`，进入Step2，当前直接结束。未运行、跳过、阻塞或部分完成时不推进。本地wheel不自行更换；调用方要求远程CPU/CUDA参考验证时，按Step1远程入口迁移可通用依赖、安装指定渠道nightly并拉回结果，参考结果不直接推进NPU支持状态。
+- [Step 0](steps/step0-testcase_check.md) 查询每个 API 的适配策略，结合本次任务已记录的状态确定下一步。
+- [Step 0.1](steps/step0.1-testcase_development.md) 按前序确定的计算类、框架类、分布式类或图模式类调用生成器编写功能用例，按任务要求在 NPU 上运行并保存报告。
+- [Step 1](steps/step1-testcase_validation.md) 核对 NPU 结果，按任务要求由本机代跑同一版用例的 GPU 测试，评估内存、精度、确定性的补测需求并更新逐 API 状态。
+- [Step 2](steps/step2-scheme_design.md) 将待适配 API 的当前状态、已有用例和测试材料交回调用方，结束本轮处理。
+- [Step 4](steps/step4-result_handoff.md) 汇总逐 API 结果、验证材料和未完成事项，交回调用方。
 
-`待适配`项交给[Step2：待适配入口](steps/step2-scheme_design.md)，当前直接结束并交回调用方；`支持`项进入[Step4：结果交回](steps/step4-result_handoff.md)，由主agent准备PR。每个API独立流转，已通过项保留有效结果。
+## 输出
 
-覆盖完整性与执行结果分别记录。仅处理本批明确的补测要求，已有文件和有效结果继续复用，不代表完成了全仓扫描。生成成功不代表覆盖完整；Step1尚未执行时结果保持`not_run`。逐API进度保存于`adapt-information.json.api-status`，适配策略和支持结论等PR合入后由AI_LOOP回填数据库；不因本地生成或测试完成就提前回填这些结论。
+交回以下材料，由调用方负责后续提交与发布。结果目录内的报告使用相对结果目录的路径。
 
-四类测试指功能、内存、精度、确定性，与生成器的计算类、框架类、分布式类 API 分类是两个维度。当前生成 skill 仅明确支持功能用例，其余三类的生成能力尚未接入。
-
-向调用方交回逐 API 处理结果及未完成事项。issue、commit、push 和 PR 由调用方统一处理；本 skill 不独立发布。
+| 交回内容 | 位置或含义 |
+|---|---|
+| 逐 API 结果 | 返回结果目录下的 `api-loop/result.json` 路径，每个 API 对应一条 `results[]`，见[字段说明](references/API-Testcase-relationship.md) |
+| 测试文件 | `results[].test_files[]`，路径相对本次 torch_npu 源码仓 |
+| NPU 验证 | `results[].execution` 记录运行状态，`results[].report` 指向实测报告或阻塞记录 |
+| GPU 验证 | `results[].device_validation.cuda` 中的 `execution`、`report`、`reason` 分别记录运行状态、报告和原因 |
+| 本批进度 | 任务状态文件的 `api-status`，按 API 正名记录 |
+| 未完成事项 | 随结果交回尚未完成的 API、原因和已有材料 |

@@ -11,6 +11,7 @@ import sys
 
 TABLE = 'API支持数据'
 CATEGORIES = {'算子类API': '计算类', '框架类API': '框架类'}
+GENERATOR_CATEGORIES = ('计算类', '框架类', '分布式类', '图模式类')
 
 
 def equivalent_names(name):
@@ -28,7 +29,9 @@ def available(row):
         raise ValueError(f'{row["API名称"]}: API已从wheel下线，不能生成适配用例')
 
 
-def prepare(database, api, task=None):
+def prepare(database, api, task=None, *, category=None, generation_only=True):
+    if category is not None and category not in GENERATOR_CATEGORIES:
+        raise ValueError('生成器类别须为计算类、框架类、分布式类或图模式类')
     database = Path(database).resolve()
     with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as conn:
         conn.row_factory = sqlite3.Row
@@ -49,13 +52,13 @@ def prepare(database, api, task=None):
         if row['适配策略'] != '补充testcase':
             raise ValueError(f'{api}: 当前适配策略不是补充testcase，返回Step0重新分流')
         adaptation_type = row['API适配分类']
-        if not adaptation_type:
+        if not adaptation_type and category is None:
             raise ValueError(f'{api}: API适配分类缺失，交回调用方补齐')
         full_name = row['API名称']
         if full_name == 'Tensor' or full_name.startswith('Tensor.'):
             full_name = 'torch.' + full_name
-        category = CATEGORIES.get(adaptation_type)
-        if category is None:
+        generator_category = category if category is not None else CATEGORIES.get(adaptation_type)
+        if generator_category is None:
             raise ValueError(f'{api}: {adaptation_type}尚无对应的生成器初分类别')
         return {
             'task': task if task is not None else api,
@@ -64,10 +67,10 @@ def prepare(database, api, task=None):
             'api_full_name': full_name,
             'strategy': row['适配策略'],
             'api_adaptation_type': adaptation_type,
-            'generator_category': category,
-            'category_is_preliminary': True,
+            'generator_category': generator_category,
+            'category_is_preliminary': category is None,
             'test_type': 'functional',
-            'generation_only': True,
+            'generation_only': generation_only,
             'classification_source': {'database': str(database), 'table': TABLE,
                                       'column': 'API适配分类'},
         }
@@ -78,9 +81,12 @@ def main():
     parser.add_argument('--database', required=True, type=Path)
     parser.add_argument('--api', required=True)
     parser.add_argument('--task')
+    parser.add_argument('--category', choices=GENERATOR_CATEGORIES)
+    parser.add_argument('--execute-npu', action='store_true')
     args = parser.parse_args()
     try:
-        result = prepare(args.database, args.api, args.task)
+        result = prepare(args.database, args.api, args.task, category=args.category,
+                         generation_only=not args.execute_npu)
     except (ValueError, sqlite3.Error, KeyError) as error:
         print('GENERATION_INPUT_FAILED: ' + str(error), file=sys.stderr)
         return 1

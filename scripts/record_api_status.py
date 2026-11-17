@@ -83,18 +83,23 @@ def record_status(adapt_information, database, results):
                 continue
             status = statuses.get(name, INITIAL[strategy])
             execution = entry.get('execution', 'not_run')
-            if execution in {'pass', 'fail'}:
+            if execution not in {'pass', 'fail', 'not_run', 'skip', 'blocked', 'partial'}:
+                raise ValueError('无效execution: ' + str(execution))
+            generation_pending = strategy == '补充testcase' and entry.get('next_step') == 'step0.1'
+            if generation_pending:
+                status = '补充testcase'
+            elif execution in {'pass', 'fail'}:
                 report = entry.get('report')
                 if not isinstance(report, str) or not report:
                     raise ValueError('测试完成后必须提供真实执行报告: ' + name)
                 if not (adapt_path.parent / report).is_file():
                     raise ValueError('执行报告不存在: ' + report)
                 status = '支持' if execution == 'pass' else '待适配'
-            elif execution not in {'not_run', 'skip', 'blocked', 'partial'}:
-                raise ValueError('无效execution: ' + str(execution))
             statuses[name] = status
             entry['status'] = status
-            if execution in {'skip', 'blocked', 'partial'}:
+            if generation_pending:
+                entry['next_step'] = 'step0.1'
+            elif execution in {'skip', 'blocked', 'partial'}:
                 entry['next_step'] = 'step1'
             elif status == '支持':
                 entry['next_step'] = 'step4'

@@ -24,12 +24,14 @@
         "precision": {"decision": "pending_evaluation", "reason": "功能用例尚未运行"},
         "determinism": {"decision": "pending_evaluation", "reason": "功能用例尚未运行"}
       },
-      "coverage": "none",
-      "coverage_reason": "当前阶段假设无已有用例，未扫描",
       "generation": "not_generated",
       "test_files": [],
       "execution": "not_run",
       "report": null,
+      "device_validation": {
+        "npu": {"execution": "not_run", "report": null},
+        "cuda": {"execution": "not_run", "report": null}
+      },
       "notes": ""
     }
   ]
@@ -39,15 +41,22 @@
 - `task` 和 `api` 保留上游标识及名称。完整调用入口与生成路径按本次源码定位，不改写任务标识。
 - 没有单独任务标识时，`task` 使用本次 API 名称；调用方提供了关联标识时原样保留。
 - `database_api`记录查到的正名行主键，`api_full_name`记录交给生成器的完整入口；不改写原来的`task`和`api`。
-- `initial_api_adaptation_type`保留本次交给生成器的数据库初分；`api_adaptation_type`保存反馈处理后的数据库适配分类；`generator_category`记录生成器最终实际采用的类别。`category_reason`保存调整原因，`classification_update`在处理反馈后取`updated`、`unchanged`或`failed`，此前为`null`。生成失败不回填，三级职责分类不随此次反馈改变。流程见[Step0.1](../steps/step0.1-testcase_development.md)。
+- `api_adaptation_type` 沿用本次查得的数据库分类，`generator_category` 是交给生成器的指定类别。历史记录中的 `initial_api_adaptation_type`、`category_reason`、`classification_update` 保留原值；新任务按 [Step0.1](../steps/step0.1-testcase_development.md) 登记文件和执行结果。
 - `strategy`保留最初查得的数据库策略；`status`是本批进度，同步保存在`adapt-information.json.api-status`，按正名主键记录`补充testcase`、`待适配`或`支持`。生成后`next_step=step1`，失败需适配时为`step2`，通过后为`step4`并交回主agent准备PR。信息缺失时不推进。
-- `coverage` 取 `none`、`partial`、`complete`、`unknown`；`coverage_reason` 写明判定依据及缺口。
-- 补测项默认 `test_type=functional`，本记录的生成、覆盖和执行状态对应功能测试。`additional_tests` 分别保存内存、精度、确定性的评估结论与原因，见[四类测试约定](test-types.md)。非补测项不启动四类测试评估，可省略这两个字段。
+- 补测项默认 `test_type=functional`，本记录的生成和执行状态对应功能测试。`additional_tests` 分别保存内存、精度、确定性的评估结论与原因，见[四类测试约定](test-types.md)。非补测项不启动四类测试评估，可省略这两个字段。
 - `generation` 取 `not_generated`、`generated`、`failed`。文件存在不等于生成任务已完成。
 - `execution` 取 `not_run`、`pass`、`fail`、`skip`、`blocked`、`partial`；`partial` 表示部分场景通过但仍有未验证场景。
+- 顶层`execution/report`只代表本地NPU验证；`device_validation.npu`保存第一轮证据，`device_validation.cuda`保存第二轮GPU参考结果。GPU通过不替代NPU，GPU失败或阻塞也不覆盖有效NPU结论。每侧保存实际命令、环境、源码版本和文件SHA256，报告路径相对本次任务目录。
+- `device_validation.npu.handoff_files` 保存该次 NPU 运行前的测试及 helper 相对路径和 SHA256，Step1 用它核对 GPU 导出内容。
+- `device_validation.npu.artifacts` 保存同次尝试的快照、报告和原始日志的任务相对路径及 SHA256；未能运行的阻塞项可以只提供快照和阻塞记录。
+- WSL GPU结果另存`run_id`、`run_attempt`、`url`、`branch`、`head_sha`、`counts`（逐API的`passed/failed/skipped`）及必要的`reason`，`report`指向引用原始artifact的逐API汇总报告。未取得Run ID、报告或可定位到API的统计时相应字段留空并说明缺口，不填猜测值；工作流成功、零用例、CPU回退或跳过不能作为GPU通过依据。
 - `test_files` 使用相对本次 torch_npu 源码仓的路径；`report` 使用相对任务结果目录的路径。其他位置的报告使用绝对路径，避免含糊的路径根目录。
 - `notes` 简短记录失败原因、适配方案、实现改动及未完成项；详细命令、环境和日志放入报告，不复制上游源码、环境、分支配置。
 
-仅生成时为`execution=not_run`、`report=null`。Step1实际运行后填写真实结果和报告，并通过`record_api_status.py`更新逐API状态；适配策略和支持结论在PR合入后才由AI_LOOP回填数据库。其余三类未评估时保持`pending_evaluation`，不冒充通过。非补测项保持 `generation=not_generated`，不依据适配策略推断其覆盖情况。
+尚未运行时为 `execution=not_run`、`report=null`。Step0.1 登记生成器的 NPU 结果与报告，Step1 在要求的验证结束后通过 `record_api_status.py` 更新逐 API 状态；适配策略和支持结论在 PR 合入后才由 AI_LOOP 回填数据库。其余三类未评估时保持 `pending_evaluation`。非补测项保持 `generation=not_generated`。
 
-同批重跑更新对应结果，保留有效文件和验证证据；报告必须能标识实际被测源码版本及环境。未来的已有用例检查可据此填入真实覆盖结论，当前不把阶段性假设当作历史扫描结果。
+同批重跑更新对应结果，保留有效文件和验证证据。报告必须能标识实际被测源码版本及环境。
+
+Step1 交回修复时，旧结果归档到 `api-loop/repairs/`，该项的 `next_step=step0.1`、`notes` 记录具体问题。已有生成状态及历史运行结论不阻止 Step0.1 重新调用生成器。新尝试登记后重新完成 Step1 验收。
+
+状态同步时，待生成或待修复项的 `next_step=step0.1` 优先于任务状态文件中的旧 `api-status`。新尝试登记为 `next_step=step1` 后，按新执行结果更新状态。
