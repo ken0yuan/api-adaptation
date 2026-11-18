@@ -15,6 +15,7 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 
+from adaptation_target import gpu_target, matches_build
 from step1_remote import export_inputs, prepare, write_json
 
 REPO = 'the-fall-moon/git_test_demo'
@@ -82,8 +83,9 @@ def bundle_files(bundle):
         if manifest['python_minor'] not in [[3, 10], [3, 11], [3, 12], [3, 13]]:
             raise ValueError('Unsupported source Python version')
         channel = manifest['torch_index'].rstrip('/').rsplit('/', 1)[-1]
-        if channel not in {'cu132', 'cu134'} or manifest.get('torch_requirement', 'torch') != 'torch':
-            raise ValueError('WSL workflow supports latest cu132/cu134 nightly only')
+        _, requirement = gpu_target(manifest)
+        if channel not in {'cu132', 'cu134'}:
+            raise ValueError('WSL requires cu132 or cu134')
         files = {}
         for name, sha in manifest['files'].items():
             path = PurePosixPath(name)
@@ -101,7 +103,10 @@ def bundle_files(bundle):
         for name in ['step1_gpu_audit.py', 'pytest.ini', 'step1-manifest.json']:
             if name in files:
                 raise ValueError('Bundle collides with relay metadata')
-        files['requirements.txt'] = archive.read('requirements.txt')
+        dependencies = archive.read('requirements.txt')
+        if requirement != 'torch':
+            dependencies = (requirement + '\n').encode() + dependencies
+        files['requirements.txt'] = dependencies
     files['step1-manifest.json'] = raw
     files['step1_gpu_audit.py'] = Path(__file__).with_name('step1_gpu_audit.py').read_bytes()
     files['pytest.ini'] = b'[pytest]\naddopts = -p step1_gpu_audit\n'
@@ -179,8 +184,10 @@ def analyze(manifest_bytes, state, run, artifact):
             raise ValueError('Device audit belongs to a different bundle')
         env = audit['environment']
         requires_cuda = any(entry.get('device_independent') is not True for entry in manifest['results'])
-        if audit['run_flag'] != '1' or not env['cuda_build'] or '.dev' not in env['torch']:
-            raise ValueError('CUDA/nightly/run-flag audit failed')
+        nightly = '/nightly/' in manifest.get('torch_index', '/nightly/')
+        if (audit['run_flag'] != '1' or not env['cuda_build'] or
+                not matches_build(env['torch'], manifest.get('torch_requirement', 'torch'), nightly)):
+            raise ValueError('CUDA/PyTorch target/run-flag audit failed')
         if requires_cuda and (not env['cuda_available'] or not env.get('gpu_name')):
             raise ValueError('Required CUDA device is unavailable')
         if 'cu' + env['cuda_build'].replace('.', '') != state['cuda_build']:

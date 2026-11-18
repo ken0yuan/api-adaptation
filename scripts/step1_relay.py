@@ -113,7 +113,7 @@ result={'manifest':base64.b64encode((out/'manifest.json').read_bytes()).decode()
             os.environ[env_name] = getpass.getpass('Target SSH password: ')
         target_config = output / 'target-connection.json'
         target_config.write_text(json.dumps(target, indent=2))
-        print('Running isolated nightly tests on target; then fetching evidence', flush=True)
+        print('Fetching target test evidence' if args.resume else 'Running isolated tests on target and fetching evidence', flush=True)
         command = [sys.executable, str(Path(__file__).with_name('step1_remote.py')), 'fetch' if args.resume else 'run', '--config', str(target_config), '--output', str(output)]
         code = subprocess.call(command)
         if not (output / 'evidence/report.json').exists():

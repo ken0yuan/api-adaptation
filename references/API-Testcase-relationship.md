@@ -13,7 +13,12 @@
       "strategy": "补充testcase",
       "status": "补充testcase",
       "initial_api_adaptation_type": null,
-      "api_adaptation_type": null,
+      "api_adaptation_type": "算子类API",
+      "classification_source": {
+        "database": "/home/workspace-ycy/SKILLS/AI_LOOP/data/api-support.sqlite3",
+        "table": "API支持数据_2.15",
+        "column": "API适配分类"
+      },
       "generator_category": null,
       "category_reason": "",
       "classification_update": null,
@@ -41,7 +46,8 @@
 - `task` 和 `api` 保留上游标识及名称。完整调用入口与生成路径按本次源码定位，不改写任务标识。
 - 没有单独任务标识时，`task` 使用本次 API 名称；调用方提供了关联标识时原样保留。
 - `database_api`记录查到的正名行主键，`api_full_name`记录交给生成器的完整入口；不改写原来的`task`和`api`。
-- `api_adaptation_type` 沿用本次查得的数据库分类，`generator_category` 是交给生成器的指定类别。历史记录中的 `initial_api_adaptation_type`、`category_reason`、`classification_update` 保留原值；新任务按 [Step0.1](../steps/step0.1-testcase_development.md) 登记文件和执行结果。
+- `classification_source` 保存本次分类的来源。示例中的 `database` 是数据库文件绝对路径，`table` 是固定版本任务实际读取的表，`column` 是分类所在列。回填分类时，按原表和 `database_api` 找到同一行；nightly 的 `table` 为 `API支持数据`。
+- `api_adaptation_type` 沿用本次查得的数据库分类，`generator_category` 是交给生成器的指定类别。分类反馈返回的 `initial_api_adaptation_type` 表示反馈前的分类，`api_adaptation_type` 表示反馈后的分类，`category_reason` 说明分类调整原因，`classification_update` 为 `updated`（已改写分类）或 `unchanged`（原分类适用）。续跑保留已有反馈记录；新任务按 [Step0.1](../steps/step0.1-testcase_development.md) 登记文件和执行结果。
 - `strategy`保留最初查得的数据库策略；`status`是本批进度，同步保存在`adapt-information.json.api-status`，按正名主键记录`补充testcase`、`待适配`或`支持`。生成后`next_step=step1`，失败需适配时为`step2`，通过后为`step4`并交回主agent准备PR。信息缺失时不推进。
 - 补测项默认 `test_type=functional`，本记录的生成和执行状态对应功能测试。`additional_tests` 分别保存内存、精度、确定性的评估结论与原因，见[四类测试约定](test-types.md)。非补测项不启动四类测试评估，可省略这两个字段。
 - `generation` 取 `not_generated`、`generated`、`failed`。文件存在不等于生成任务已完成。

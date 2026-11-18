@@ -51,6 +51,25 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(after[0], tuple(expected))
         self.assertEqual(after[1], before[1])
 
+    def test_fixed_feedback_updates_only_the_originating_table(self):
+        table = 'API支持数据_2.15'
+        with closing(sqlite3.connect(self.database)) as c, c:
+            c.execute('CREATE TABLE "API支持数据_2.15" AS SELECT * FROM "API支持数据"')
+        before = self.rows()
+        handoff = prepare(self.database, 'torch.long_alias', table=table)
+        self.assertEqual(handoff['classification_source']['table'], table)
+        feedback = dict(self.feedback, classification_source=handoff['classification_source'])
+        with self.assertRaisesRegex(ValueError, 'table mismatch'):
+            apply_feedback(self.database, feedback, self.source, table='API支持数据')
+        apply_feedback(self.database, feedback, self.source)
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(prepare(self.database, 'torch.det', table=table)['api_adaptation_type'], '算子类API')
+        self.assertEqual(prepare(self.database, 'torch.det')['api_adaptation_type'], '框架类API')
+        with self.assertRaises(sqlite3.OperationalError):
+            prepare(self.database, 'torch.det', table='API支持数据_2.14')
+        with self.assertRaisesRegex(ValueError, 'Invalid strategy table'):
+            prepare(self.database, 'torch.det', table='arbitrary')
+
     def test_repeat_feedback_is_idempotent(self):
         apply_feedback(self.database, self.feedback, self.source)
         before = self.rows()
@@ -63,10 +82,29 @@ class FeedbackTests(unittest.TestCase):
         feedback = dict(self.feedback, api_adaptation_type='算子类API', generator_category='框架类', category_reason='测试分类修正示例')
         self.assertEqual(apply_feedback(self.database, feedback, self.source)['api_adaptation_type'], '框架类API')
 
-    def test_distributed_category_keeps_framework_database_type(self):
+    def test_distributed_feedback_round_trips_through_the_database(self):
         feedback = dict(self.feedback, generator_category='分布式类', category_reason='采用分布式专项规范')
-        self.assertEqual(apply_feedback(self.database, feedback, self.source)['classification_update'], 'unchanged')
-        self.assertEqual(self.rows()[0][6], '否')
+        self.assertEqual(apply_feedback(self.database, feedback, self.source)['classification_update'], 'updated')
+        self.assertEqual(self.rows()[0][5:7], ('分布式类API', '是'))
+        self.assertEqual(prepare(self.database, 'torch.long_alias')['generator_category'], '分布式类')
+
+    def test_graph_feedback_preserves_category_and_updates_only_the_fixed_representative(self):
+        table = 'API支持数据_2.14'
+        with closing(sqlite3.connect(self.database)) as c, c:
+            c.execute(f'CREATE TABLE "{table}" AS SELECT * FROM "API支持数据"')
+            c.execute(f'UPDATE "{table}" SET "API适配分类"=NULL WHERE "API名称"=?', ('torch.det',))
+        before = self.rows()
+        handoff = prepare(self.database, 'torch.long_alias', table=table, category='图模式类')
+        feedback = dict(self.feedback, **handoff)
+        result = apply_feedback(self.database, feedback, self.source)
+        self.assertEqual(result['generator_category'], '图模式类')
+        self.assertEqual(result['api_adaptation_type'], '图模式类API')
+        self.assertEqual(result['classification_update'], 'updated')
+        self.assertEqual(prepare(self.database, 'torch.long_alias', table=table)['generator_category'], '图模式类')
+        self.assertEqual(self.rows(), before)
+        with closing(sqlite3.connect(self.database)) as c:
+            self.assertEqual(c.execute(f'SELECT "API适配分类" FROM "{table}" WHERE "API名称"=?',
+                                       ('torch.long_alias',)).fetchone(), (None,))
 
     def test_failed_generation_or_missing_file_cannot_update_database(self):
         for change in [{'generation':'failed'}, {'test_files':[]}, {'test_files':['test/api_supplement/missing.py']}]:

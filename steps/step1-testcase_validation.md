@@ -55,9 +55,9 @@ cat <torch_npu源码仓>/test/api_supplement/README.md
 
 1. 任务环境。
    - Python、wheel、源码和开发分支与本次交接一致。
-   - 报告包含 Python、PyTorch 版本及源码提交，使用 torch_npu、CANN 时记录对应版本。
+   - 报告包含实际 Python、PyTorch 版本及已记录的源码提交，使用 torch_npu、CANN 时记录对应版本。
    - 记录实际 wheel 构建及可获得的构建、上传日期。
-   - 上游没有新 nightly 时，已有环境满足本次 API 的测试需求即可继续验证。需要升级时交回调用方准备环境。
+   - 固定版本沿用本次发行版本的源码目录和 venv。nightly 任务在上游没有新 nightly 时，已有环境满足本次 API 的测试需求即可继续验证。需要升级时交回调用方准备环境。
    - 明确要求新构建的任务，核对所用构建是否满足要求。
 2. 导入路径。
    - 核对实际导入的 `torch`、`torch_npu` 的文件来源与提供的虚拟环境一致。
@@ -122,7 +122,7 @@ python <脚本目录>/step1_remote.py prepare --config <导出配置> --output <
 
 3. 准备 GPU 环境参数。
    - Python 匹配本次解释器主次版本，当前支持 3.10～3.13。
-   - CUDA nightly 使用 `cu132` 或 `cu134`，记录实际构建和两侧版本差异。
+   - GitHub GPU 工作流使用 `cu132` 或 `cu134`。固定版本直接沿用 AI_LOOP Step 0 在本次运行目录 `requirements.txt` 中写好的 torch 约束，随可迁移依赖交给 GPU 工作流；nightly 沿用未固定 torch 的清单。记录 NPU、GPU 的实测构建。
 
 ### 2. 上传 GitHub 并触发验证
 
@@ -214,16 +214,16 @@ python <脚本目录>/step1_wsl_gpu.py import --config <导出配置> --output <
 
 ### 2. 同步本批状态
 
-本批要求的验证结束并落盘后，执行状态脚本。
+本批要求的验证结束并落盘后，执行状态脚本。补测中若已确认目标平台不支持某场景，在该 API 的 `notes` 记录设备型号、受限调用、限制依据和原始报告路径，保留实测结论并交主控发布补测 PR。GPU 参考验证按原流程继续，尚在运行时如实交接进度，结果回填同一 PR。
 
 ```bash
 python3 <api-adaptation安装目录>/scripts/record_api_status.py \
   --adapt-information <本次任务状态文件绝对路径> \
-  --database <API策略表绝对路径> \
+  --database <API策略数据库绝对路径> --table "<本次策略表名>" \
   --results <本次api-loop/result.json绝对路径>
 ```
 
-1. 同批还有 API 等待 GPU 时，收到结果或记录实际阻塞原因后再同步。
+1. 同批还有 API 等待 GPU 时，通常在收到结果或记录实际阻塞原因后同步。符合平台限制发布条件的补测批次，先按已有 NPU 结论同步并交接。
 2. 脚本读取整份结果文件，依据各 API 的顶层 NPU 结论更新任务状态文件的 `api-status`。
    - `next_step=step0.1` 的待生成或待修复项保持该去向，并将本批状态更新为 `补充testcase`，避免旧的支持状态覆盖修复任务。
    - `pass`、`fail` 必须有实际执行报告，报告路径相对结果目录。
@@ -236,8 +236,8 @@ python3 <api-adaptation安装目录>/scripts/record_api_status.py \
 | 有效 NPU 结论 | 本批状态 | 后续 |
 |---|---|---|
 | 通过 | `支持` | Step4 汇总，向调用方交付 GPU 结果或阻塞原因 |
-| 失败 | `待适配` | 等本批 Step0.1 和 Step1 完成后，携带两侧证据及差异分析统一交 Step2 |
-| 未运行、跳过、阻塞或部分完成 | 保留原状态，新补测项保持 `补充testcase` | 留在 Step1，保留尚缺材料和原因 |
+| 失败 | `待适配` | 明确平台限制的补测项可直接交主控发布；其他失败携带两侧证据及差异分析交 Step2 |
+| 未运行、跳过、阻塞或部分完成 | 保留原状态，新补测项保持 `补充testcase` | 已按上述规则确认平台限制的补测项可交主控发布；其他情况留在 Step1，保留尚缺材料和原因 |
 
 ## 其他入口与测试范围
 

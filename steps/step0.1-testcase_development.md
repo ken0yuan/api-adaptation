@@ -9,7 +9,7 @@
 | 本批处理 API 清单 | Step0 交来的补测项，或 Step1 交回的待修复项及原任务标识 |
 | 本次结果文件 | 结果目录下的 `api-loop/result.json`，按 `results[].api` 定位记录 |
 | API 类别 | 前序确定的四类 API 类别，已记录时从 `results[].generator_category` 读取 |
-| API 策略数据库路径 | 复核正名、可用性和当前策略，读取数据库原分类 |
+| API 策略数据库和表名 | 使用调用方交接的表名，或从本次运行目录确定表名，在同一张表查询正名、策略和分类 |
 | Python 解释器 | 沿用调用方提供的解释器和环境加载脚本 |
 | PyTorch 源码 | 定位 API 的完整入口、签名和行为契约 |
 | torch_npu 源码 | 生成器的工作目录，测试写入此仓的 `test/api_supplement/` |
@@ -25,13 +25,13 @@ Step1 交回的 API 直接进入本步修复流程。已有 `generation=generate
 
 ```bash
 python3 <api-adaptation安装目录>/scripts/prepare_testcase_handoff.py \
-  --database <API策略数据库绝对路径> --api <results[].api> \
+  --database <API策略数据库绝对路径> --table "<本次策略表名>" --api <results[].api> \
   --category <计算类|框架类|分布式类|图模式类> --task <原任务标识> --execute-npu
 ```
 
-- 没有独立任务标识时省略 `--task`。`--execute-npu` 将交接中的 `generation_only` 设为 `false`，本步交付生成并执行 NPU 的任务。
-- 将脚本返回的 `task`、`api`、`database_api`、`api_full_name`、`api_adaptation_type`、`generator_category` 保存到对应的 `results[]`。
-- `api_adaptation_type` 保留数据库原分类，`generator_category` 保存本次指定的四类 API 类别。
+- AI_LOOP 调用可用 `--run-dir <本次运行目录>` 代替 `--table`，按 Step 0 的 venv 自动选表。没有独立任务标识时省略 `--task`。`--execute-npu` 将交接中的 `generation_only` 设为 `false`，本步交付生成并执行 NPU 的任务。
+- 将脚本返回的 `task`、`api`、`database_api`、`api_full_name`、`api_adaptation_type`、`generator_category`、`classification_source` 保存到对应的 `results[]`。
+- `category_is_preliminary` 表示生成器类别如何确定：传了 `--category` 为 `false`，省略时按数据库分类推导，为 `true`。它和 `generation_only` 都是本次调用生成器的参数。
 - 前序类别缺失时记录缺项，交回调用方补齐。策略或可用性已变化时返回 [Step0](step0-testcase_check.md) 重新分流。
 
 ## 2. 调用生成器
@@ -52,6 +52,10 @@ python3 <api-adaptation安装目录>/scripts/prepare_testcase_handoff.py \
    - 符合 API 契约的断言仍失败，或环境使测试无法执行时，由生成器保留实际结果及原因。
    - 生成器询问是否执行时，由 Step0.1 按本次调用直接确认，继续完成 NPU 测试。
    - 将自检命令、退出码和输出随执行报告交回，供 Step1 复核并直接复用。
+
+本批需要回填分类时，将生成器反馈和原交接的 `classification_source` 一起传给 `scripts/apply_testcase_feedback.py --database <数据库路径> --table "<本次策略表名>" --feedback <反馈JSON> --torch-npu-source <源码目录>`，仅更新本次表中的正名行。
+
+回填正名行的 `API适配分类` 时，计算类写 `算子类API`，框架类写 `框架类API`，分布式类写 `分布式类API`，图模式类写 `图模式类API`。下次读取该行时，按同一对应关系确定生成器类别。
 
 生成成功后核对实际测试文件，将 `generation=generated` 和 `test_files[]` 写入结果文件。生成失败时记录 `generation=failed` 和 `notes`，继续处理其余 API。
 
@@ -99,6 +103,7 @@ python3 <api-adaptation安装目录>/scripts/npu_handoff.py record \
 |---|---|
 | `api_full_name` | 交给生成器的 API 完整入口 |
 | `api_adaptation_type` | 数据库原分类 |
+| `classification_source` | 分类来源的数据库路径、表名和列名，用于将分类反馈写回原表 |
 | `generator_category` | 本次使用的四类 API 类别 |
 | `generation` | 实际生成状态 |
 | `test_files[]` | 实际测试文件，路径相对 torch_npu 源码仓 |

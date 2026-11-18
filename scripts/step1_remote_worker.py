@@ -15,6 +15,7 @@ import traceback
 import unittest
 
 
+
 def save(path, data):
     Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
 
@@ -61,16 +62,18 @@ def run_file(file, device, report):
 
 
 def probe(device, report):
+    from adaptation_target import matches_build
     import torch
     data = {'python': sys.version, 'executable': sys.executable, 'torch': torch.__version__, 'torch_git_version': torch.version.git_version,
             'torch_file': torch.__file__, 'cuda_build': torch.version.cuda, 'cuda_available': torch.cuda.is_available(), 'device': device}
     if importlib.util.find_spec('torch_npu') is not None:
         raise RuntimeError('Remote environment unexpectedly contains torch_npu')
-    if '.dev' not in torch.__version__:
-        raise RuntimeError('Expected a nightly development build')
+    manifest = json.loads(Path(__file__).with_name('manifest.json').read_bytes())
+    if not matches_build(torch.__version__, manifest.get('torch_requirement', 'torch'), '/nightly/' in manifest['torch_index']):
+        raise RuntimeError('Installed torch differs from the requested target')
     if device == 'cuda':
         if not torch.version.cuda or not torch.cuda.is_available():
-            raise RuntimeError('CUDA nightly installed, but CUDA is unavailable')
+            raise RuntimeError('CUDA build installed, but CUDA is unavailable')
         tensor = torch.ones(2, device='cuda') * 3
         torch.cuda.synchronize()
         if tensor.sum().item() != 6:
@@ -116,7 +119,7 @@ def main():
         install_log = evidence / 'install.log'
         commands = [[sys.executable, '-m', 'venv', str(root / 'venv')],
                     [str(python), '-m', 'pip', 'install', '-r', 'requirements.txt'],
-                    [str(python), '-m', 'pip', 'install', '--upgrade', '--pre', manifest['torch_requirement'], '--index-url', manifest['torch_index'], '-c', 'requirements.txt'],
+                    [str(python), '-m', 'pip', 'install', '--upgrade', *(['--pre'] if '/nightly/' in manifest['torch_index'] else []), manifest['torch_requirement'], '--index-url', manifest['torch_index'], '-c', 'requirements.txt'],
                     [str(python), '-m', 'pip', 'check']]
         os.environ.update(PYTHONNOUSERSITE='1', TORCH_DEVICE_BACKEND_AUTOLOAD='0', RUN_SUPPLEMENT_API_TESTS='1', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
         os.environ.pop('PYTHONPATH', None)

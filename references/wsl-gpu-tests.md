@@ -40,7 +40,7 @@ python3 <api-adaptation>/scripts/step1_remote.py prepare \
 
 依赖从源解释器导出可通用版本，由GPU 服务器重新安装对应架构的包。torch/torch_npu、设备运行时及CANN本地包按现有导出规则排除并记录原因；其他本地/editable/URL依赖须提供替代方案或在`exclude_packages`逐包说明原因，不能静默丢弃。缺依赖、系统库或多卡能力时记录实际限制。
 
-Python版本匹配源环境主次版本，当前支持3.10～3.13；渠道为`cu132`或`cu134`，不支持用此工作流固定torch版本。记录实际nightly与源码差异，不声称和NPU wheel同提交。未满足版本或依赖条件时交回补齐。
+Python 版本匹配源环境主次版本，当前支持 3.10～3.13。GPU 渠道为 `cu132` 或 `cu134`。固定版将示例的 `torch_index` 改为 `https://download.pytorch.org/whl/cu132` 或对应 cu134 地址。AI_LOOP 运行沿用 Step 0 在本次 `requirements.txt` 中写好的 torch 约束；独立运行在配置中填写 `torch_requirement` 为 `torch==<完整发行版本>`。提交脚本将该 pin 写入 GitHub 根目录 requirements.txt，runner 按原工作流复用 venv。回读验证报告时核对实测版本和 CUDA 渠道。未满足版本或依赖条件时交回补齐。
 
 服务器端AI不能操作本机时，交付配置、输出目录、导出包及本批API/文件列表，记录`cuda.execution=not_run`、`reason=awaiting_workstation_gpu`并留在Step1。服务器缺少GitHub登录本身不属于GPU执行失败。
 
@@ -100,7 +100,7 @@ python <本机scripts>/step1_wsl_bridge.py fetch --config <本机bridge.json> --
 
 ## 3. 结果核对和服务器导入
 
-设备审计插件随测试提交，核对 `RUN_SUPPLEMENT_API_TESTS=1`、源文件哈希、实际 nightly/CUDA/GPU 及测试 setup/call/teardown 结果。设备相关 API 还须满足模块 `DEVICE_NAME=cuda`，已确认无设备依赖的 API 按 manifest 中的标记核验。GPU 型号记录实际值。Runner 仍用 pytest 收集 unittest 用例。
+设备审计插件随测试提交，核对 `RUN_SUPPLEMENT_API_TESTS=1`、源文件哈希、实际 PyTorch 版本、CUDA 和 GPU 及测试 setup/call/teardown 结果。设备相关 API 还须满足模块 `DEVICE_NAME=cuda`，已确认无设备依赖的 API 按 manifest 中的标记核验。GPU 型号记录实际值。Runner 仍用 pytest 收集 unittest 用例。
 
 本机结合`commit.txt`、`selected-files.txt`、`environment.txt`、`packages.txt`、`junit.xml`、`test-output.tar.gz`中的`step1-audit.json`及失败日志生成`evidence/report.json`，逐API统计通过、失败、跳过数。零用例、选测缺失或跳过时按实际进度记录。纯 Python API 核对实际语义断言；需要 GPU 的场景回退 CPU 或缺少设备证据时，记录该场景验证未完成。Runner离线、安装或报告缺失记录阻塞及恢复入口。两个设备均通过不等于输出逐项相等，精确比对须由用例携带参考数据并断言。
 

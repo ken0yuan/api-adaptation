@@ -50,6 +50,59 @@ class WslTests(unittest.TestCase):
             archive.addfile(item, io.BytesIO(data))
         return analyze(self.raw, self.state, self.run, self.artifact)
 
+    def test_fixed_gpu_target_requires_exact_public_version(self):
+        self.manifest.update(torch_index='https://download.pytorch.org/whl/cu132',torch_requirement='torch==2.15.0')
+        self.raw = json.dumps(self.manifest).encode()
+        self.audit['manifest_sha256'] = hashlib.sha256(self.raw).hexdigest()
+        for version, expected in [('2.15.0+cu132','pass'),('2.15.1+cu132','blocked'),
+                                  ('2.15.0.dev20261118+cu132','blocked')]:
+            self.audit['environment']['torch'] = version
+            self.assertEqual(self.report()['execution'], expected)
+
+    def test_ai_loop_gpu_uses_step0_requirements_for_nightly_and_retry(self):
+        from adaptation_target import gpu_target
+        from step1_remote import export_inputs
+        run = self.root/'run'
+        run.mkdir()
+        write_json(run/'basic_information.json', {'python_version':'3.11.17', 'venv':'data/venv/python-3.11.17'})
+        path = run/'requirements.txt'
+        path.write_text('torch-npu==2.15.0\ntorch==2.14; python_version < "3.11"\n')
+        nightly = 'https://download.pytorch.org/whl/nightly/cu132'
+        config = {'run_dir':str(run),'source_root':str(self.source),'torch_index':nightly}
+        self.assertEqual(gpu_target(config), (nightly, 'torch'))
+        with self.assertRaisesRegex(ValueError, 'conflicts with Step 0'):
+            gpu_target(dict(config, torch_requirement='torch==2.15'))
+        path.write_text('torch==2.15\n')
+        release = 'https://download.pytorch.org/whl/cu132'
+        config['torch_index'] = release
+        manifest = dict(self.manifest, torch_requirement='torch==2.15.0', torch_index=release)
+        export_inputs(config, {'results':self.manifest['results']}, manifest)
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, 'Missing Step 0 requirements'):
+            gpu_target(config)
+
+    def test_fixed_export_translates_cpu_source_to_workflow_release_pin(self):
+        from unittest.mock import patch
+        from step1_remote import prepare, export_inputs
+        from step1_wsl_gpu import bundle_files
+        run = self.root/'run'
+        run.mkdir()
+        write_json(run/'basic_information.json', {'venv':'data/venv/torch-2.15.0/python-3.11.17','python_version':'3.11.17'})
+        (run/'requirements.txt').write_text('-c torch-constraints.txt\n')
+        (run/'torch-constraints.txt').write_text('torch==2.15; python_version == "3.11"\n')
+        write_json(run/'result.json', {'results': self.manifest['results']})
+        config = {'source_root':str(self.source), 'source_python':'fixture','run_dir':str(run),
+                  'results':str(run/'result.json'), 'torch_index':'https://download.pytorch.org/whl/cu132'}
+        inventory = {'python':[3,11,17], 'packages':[{'name':'torch','version':'2.15.0+cpu','direct':{}}]}
+        with patch('step1_remote.inventory', return_value=inventory):
+            manifest = prepare(config,run/'export')
+        self.assertEqual(manifest['torch_requirement'], 'torch==2.15')
+        _, _, files = bundle_files(run/'export/bundle.zip')
+        self.assertEqual(files['requirements.txt'], b'torch==2.15\n')
+        (run/'requirements.txt').write_text('torch==2.14\n')
+        with self.assertRaisesRegex(ValueError, 'different PyTorch target'):
+            export_inputs(config, {'results': self.manifest['results']}, manifest)
+
     def test_gpu_pass_requires_complete_cuda_execution_and_matches_file(self):
         report = self.report()
         self.assertEqual(report['results'][0]['execution'], 'pass')

@@ -11,7 +11,8 @@ import sqlite3
 import sys
 import tempfile
 
-from prepare_testcase_handoff import available, equivalent_names
+from adaptation_target import run_target, strategy_table
+from prepare_testcase_handoff import representative
 
 INITIAL = {'补充testcase': '补充testcase', '待适配': '待适配', '已支持': '支持'}
 
@@ -36,26 +37,10 @@ def write_object(path, value):
         temporary.unlink(missing_ok=True)
 
 
-def representative(conn, name):
-    row = None
-    for candidate in equivalent_names(name):
-        row = conn.execute('SELECT * FROM "API支持数据" WHERE "API名称"=?', (candidate,)).fetchone()
-        if row is not None:
-            break
-    if row is None:
-        raise ValueError('API条目不存在: ' + name)
-    available(row)
-    if row['API真正名字']:
-        row = conn.execute('SELECT * FROM "API支持数据" WHERE "API名称"=?',
-                           (row['API真正名字'],)).fetchone()
-        if row is None or row['API真正名字']:
-            raise ValueError('正名关系无效: ' + name)
-        available(row)
-    return row
-
-
-def record_status(adapt_information, database, results):
+def record_status(adapt_information, database, results, *, table=None):
     adapt_path, results_path = Path(adapt_information).resolve(), Path(results).resolve()
+    target = run_target(adapt_path.parent)
+    table = strategy_table(table, target[0] if target else None)
     adapt, result = read_object(adapt_path), read_object(results_path)
     if not results_path.is_relative_to(adapt_path.parent):
         raise ValueError('结果文件必须属于本次运行目录')
@@ -72,9 +57,10 @@ def record_status(adapt_information, database, results):
         allowed = set()
         for task in tasks:
             if task.startswith('adapt-'):
-                allowed.add(representative(conn, task[len('adapt-'):])['API名称'])
+                allowed.add(representative(conn, task[len('adapt-'):], table)['API名称'])
         for entry in entries:
-            row = representative(conn, entry['api'])
+            strategy_table(table, entry.get('classification_source', {}).get('table'))
+            row = representative(conn, entry['api'], table)
             name = row['API名称']
             if name not in allowed or entry.get('database_api', name) != name:
                 raise ValueError('结果不属于本次任务或正名已变化: ' + entry['api'])
@@ -118,10 +104,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--adapt-information', required=True, type=Path)
     parser.add_argument('--database', required=True, type=Path)
+    parser.add_argument('--table', help='Expected table from the current handoff')
     parser.add_argument('--results', required=True, type=Path)
     args = parser.parse_args()
     try:
-        result = record_status(args.adapt_information, args.database, args.results)
+        result = record_status(args.adapt_information, args.database, args.results, table=args.table)
     except (ValueError, KeyError, TypeError, OSError, sqlite3.Error) as error:
         print('API_STATUS_FAILED: ' + str(error), file=sys.stderr)
         return 1

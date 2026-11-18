@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare, execute and fetch Step1 tests using a remote nightly environment."""
+"""Prepare, execute and fetch Step1 tests using a remote PyTorch environment."""
 import argparse
 import base64
 import datetime
@@ -15,6 +15,8 @@ import sys
 import tempfile
 import time
 import zipfile
+
+from adaptation_target import equivalent_requirements, gpu_target, matches_build
 
 
 def write_json(path, data):
@@ -45,7 +47,7 @@ def portable_packages(packages, exclude):
         name = normalize(item['name'])
         url = item.get('direct', {}).get('url', '')
         if name in {'torch', 'torch-npu', 'torchvision', 'torchaudio', 'torch-musa', 'triton'} or name.startswith('nvidia-'):
-            reason = 'Replaced by target PyTorch nightly runtime'
+            reason = 'Replaced by target PyTorch runtime'
         elif name in exclude:
             reason = exclude[name]
         elif any(s in url.lower() for s in ['/ascend/', '/selfgz', '/cann/']):
@@ -100,6 +102,10 @@ def collect_files(root, test_paths, extra_paths):
 def export_inputs(config, data, manifest=None, *, legacy_subset=False):
     """Select this dispatch and compare the files with each generator NPU run."""
     root = Path(config['source_root']).resolve()
+    if manifest and 'torch_index' in config:
+        index, req = gpu_target(config)
+        if index != manifest.get('torch_index') or not equivalent_requirements(req, manifest.get('torch_requirement', 'torch')):
+            raise ValueError('Saved GPU export belongs to a different PyTorch target')
     rows = data['results']
     handoff = bool(manifest and manifest.get('npu_handoff')) or any(
         'handoff_files' in row.get('device_validation', {}).get('npu', {}) for row in rows)
@@ -172,18 +178,15 @@ def prepare(config, output):
     inv = inventory(config['source_python'])
     kept, omitted = portable_packages(inv['packages'], {normalize(k): v for k, v in config.get('exclude_packages', {}).items()})
     device = config.get('device', 'cuda')
-    index = config['torch_index'].rstrip('/')
-    channel = index.rsplit('/', 1)[-1]
-    if not re.fullmatch(r'https://download\.pytorch\.org/whl/nightly/(cpu|cu[0-9]+)', index):
-        raise ValueError('torch_index must be an official CPU/CUDA nightly channel')
-    if device not in {'cpu', 'cuda'} or (device == 'cpu') != (channel == 'cpu'):
-        raise ValueError('device and nightly channel disagree')
+    index, requirement = gpu_target(config)
+    if '/nightly/' not in index:
+        source_torch = next((pkg['version'] for pkg in inv['packages'] if normalize(pkg['name']) == 'torch'), None)
+        if not matches_build(source_torch, requirement, False):
+            raise ValueError('Source torch version disagrees with the fixed release')
     manifest = {'schema_version': 1, 'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'device': device,
-                'python_minor': inv['python'][:2], 'torch_index': index, 'torch_requirement': config.get('torch_requirement', 'torch'),
+                'python_minor': inv['python'][:2], 'torch_index': index, 'torch_requirement': requirement,
                 'packages': kept, 'excluded_packages': omitted, 'files': hashes, 'results': entries,
                 'timeout_per_file': int(config.get('timeout_per_file', 300)), 'install_timeout': int(config.get('install_timeout', 1800))}
-    if not re.fullmatch(r'torch(?:==[A-Za-z0-9.+_-]+)?', manifest['torch_requirement']):
-        raise ValueError('torch_requirement must be torch or a pinned torch version')
     if handoff:
         manifest['npu_handoff'] = True
     for key, command in [('source_commit', ['git', '-C', str(root), 'rev-parse', 'HEAD']), ('source_branch', ['git', '-C', str(root), 'branch', '--show-current'])]:
@@ -208,6 +211,7 @@ def prepare(config, output):
             archive.write(stage / 'manifest.json', 'manifest.json')
             archive.write(stage / 'requirements.txt', 'requirements.txt')
             archive.write(Path(__file__).with_name('step1_remote_worker.py'), 'worker.py')
+            archive.write(Path(__file__).with_name('adaptation_target.py'), 'adaptation_target.py')
         stage.rename(output)
     return manifest
 

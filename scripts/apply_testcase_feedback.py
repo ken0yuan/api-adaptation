@@ -9,15 +9,18 @@ from pathlib import Path
 import sqlite3
 import sys
 
-from prepare_testcase_handoff import CATEGORIES, prepare
+from adaptation_target import strategy_table
+from prepare_testcase_handoff import ADAPTATION_TYPES, prepare
 
-ADAPTATION_TYPES = {'计算类': '算子类API', '框架类': '框架类API', '分布式类': '框架类API'}
 
-
-def apply_feedback(database, feedback, torch_npu_source):
+def apply_feedback(database, feedback, torch_npu_source, *, table=None):
+    origin = feedback.get('classification_source', {})
+    table = strategy_table(table, origin.get('table'))
+    if origin.get('database') and Path(origin['database']).resolve() != Path(database).resolve():
+        raise ValueError('反馈与当前策略数据库不一致')
     category = feedback['generator_category']
     if category not in ADAPTATION_TYPES:
-        raise ValueError('生成器必须返回计算类、框架类或分布式类')
+        raise ValueError('生成器必须返回计算类、框架类、分布式类或图模式类')
     if feedback.get('generation') != 'generated' or not feedback.get('test_files'):
         raise ValueError('仅在对应类别的用例生成成功后回填分类')
     source = Path(torch_npu_source).resolve()
@@ -33,12 +36,12 @@ def apply_feedback(database, feedback, torch_npu_source):
     original_type = feedback['api_adaptation_type']
     final_type = ADAPTATION_TYPES[category]
     reason = feedback.get('category_reason', '').strip()
-    if category != CATEGORIES.get(original_type) and not reason:
+    if final_type != original_type and not reason:
         raise ValueError('调整适配分类时需要生成器说明原因')
     database = Path(database).resolve()
     with closing(sqlite3.connect(database.as_uri() + '?mode=rw', uri=True)) as conn:
         conn.execute('BEGIN IMMEDIATE')
-        current = prepare(database, feedback['api'])
+        current = prepare(database, feedback['api'], category=category, table=table)
         if current['database_api'] != feedback['database_api']:
             raise ValueError('正名关系已变化，请重新读取当前API条目')
         full_name = current['api_full_name']
@@ -52,7 +55,7 @@ def apply_feedback(database, feedback, torch_npu_source):
             raise ValueError('API适配分类已被其他任务修改，请核对后再回填')
         changed = current_type != final_type
         if changed:
-            conn.execute('UPDATE "API支持数据" SET "API适配分类"=?,"分类待审核"=? WHERE "API名称"=?',
+            conn.execute(f'UPDATE "{table}" SET "API适配分类"=?,"分类待审核"=? WHERE "API名称"=?',
                          (final_type, '是', current['database_api']))
         conn.commit()
     return {'database_api': current['database_api'], 'initial_api_adaptation_type': original_type,
@@ -63,12 +66,13 @@ def apply_feedback(database, feedback, torch_npu_source):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--database', required=True, type=Path)
+    parser.add_argument('--table', help='Expected table from the current handoff')
     parser.add_argument('--feedback', required=True, type=Path)
     parser.add_argument('--torch-npu-source', required=True, type=Path)
     args = parser.parse_args()
     try:
         feedback = json.loads(args.feedback.read_text(encoding='utf-8'))
-        result = apply_feedback(args.database, feedback, args.torch_npu_source)
+        result = apply_feedback(args.database, feedback, args.torch_npu_source, table=args.table)
     except (ValueError, KeyError, TypeError, OSError, sqlite3.Error) as error:
         print('CLASSIFICATION_FEEDBACK_FAILED: ' + str(error), file=sys.stderr)
         return 1

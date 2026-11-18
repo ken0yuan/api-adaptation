@@ -1,6 +1,6 @@
-# Step1 远程 CPU/CUDA nightly 验证
+# Step1 远程 CPU/CUDA 验证
 
-调用方指定远程服务器、测试源码、结果文件和 nightly 渠道后，AI 直接调用 `scripts/step1_remote.py run`。该入口只复制本批测试文件、明确列出的 helper 和依赖版本，不复制 PyTorch/torch_npu 实现源码或整个虚拟环境。安装和执行均发生在远程新目录，不改本地被测环境。
+调用方指定远程服务器、测试源码、结果文件和对应版本的 PyTorch 渠道后，AI 直接调用 `scripts/step1_remote.py run`。该入口只复制本批测试文件、明确列出的 helper 和依赖版本，不复制 PyTorch/torch_npu 实现源码或整个虚拟环境。安装和执行均发生在远程新目录，不改本地被测环境。
 
 ## 配置
 
@@ -30,7 +30,7 @@
 
 `source_python` 使用调用方已准备的解释器；从当前 `basic_information.json` 核对路径。远程 Python 主、次版本须一致，CPU 架构可以不同：依赖由远程 pip 重新获取对应架构的包。目标解释器尚不存在时，先根据已授权的环境准备方式安装匹配的 Python，再调用入口。
 
-CUDA 渠道由目标驱动和可用 nightly 确定，示例中的 cu128 不是通用默认值。只接受 PyTorch 官方 nightly 索引；默认安装该 Python/平台可用的最新 nightly。需要复现时可指定 `torch_requirement` 为 `torch==完整版本`。完整版本与源码提交、构建提交差异写入报告，不能宣称 nightly 与本地 wheel 同提交。
+CUDA 渠道由目标驱动和可用 nightly 确定，示例中的 cu128 不是通用默认值。使用对应目标的官方索引。nightly 默认安装最新可用构建；固定版本使用 `https://download.pytorch.org/whl/<cpu或cu渠道>`，AI_LOOP 运行沿用 Step 0 的 `requirements.txt` 中生效的 torch 约束，独立任务传入精确的 `torch_requirement`。需要复现时可指定 `torch_requirement` 为 `torch==完整版本`。完整版本与源码提交、构建提交差异写入报告，不能宣称 nightly 与本地 wheel 同提交。
 
 控制端需要 `paramiko`，安装在独立的控制环境即可，不改源测试环境。SSH 可用现有密钥/agent；密码登录使用外部环境变量 `API_ADAPT_SSH_PASSWORD`（可用 `password_env` 改名），密码不写配置、命令行、测试包或报告。使用系统已信任主机密钥；新服务器可在配置中设置经确认的 `host_key_sha256` 指纹，不关闭主机身份校验。
 
@@ -43,11 +43,11 @@ CUDA 渠道由目标驱动和可用 nightly 确定，示例中的 cu128 不是�
   --merge
 ```
 
-新输出目录不存在时自动准备包，然后连接服务器、创建同名远程目录、重建虚拟环境、安装依赖和 nightly、实际执行 unittest 并拉回报告。目录须每次唯一，避免覆盖旧运行。`--merge` 将逐 API 结果回填到 `api-loop/result.json.device_validation.cuda`；不提供该选项时只输出报告。
+新输出目录不存在时自动准备包，然后连接服务器、创建同名远程目录、重建虚拟环境、安装依赖和目标版本的 PyTorch、实际执行 unittest 并拉回报告。目录须每次唯一，避免覆盖旧运行。`--merge` 将逐 API 结果回填到 `api-loop/result.json.device_validation.cuda`；不提供该选项时只输出报告。
 
 可选 `prepare` 动作用于只生成依赖清单和测试包供检查，不登录服务器。已有任务中断后用 `fetch --config ... --output 原输出目录 --merge` 拉回已产生的结果；不得把连接异常或缺失报告当通过。
 
-CPU 验证必须显式配置 `device=cpu`、`torch_index=https://download.pytorch.org/whl/nightly/cpu`；不能因 CUDA 不可用自动切换 CPU。
+CPU 验证必须显式配置 `device=cpu`、对应任务的官方 CPU 索引（nightly 为 `https://download.pytorch.org/whl/nightly/cpu`，固定版本为 `https://download.pytorch.org/whl/cpu`）；不能因 CUDA 不可用自动切换 CPU。
 
 ## 源机出站防火墙：本机中转模式
 
@@ -87,9 +87,9 @@ CPU 验证必须显式配置 `device=cpu`、`torch_index=https://download.pytorc
 ## 环境迁移的边界
 
 - 导出源解释器实际安装的可通用包版本，在远程按相同版本重装；不复制 ARM 二进制目录、CANN 环境变量或 NPU 的动态库路径。
-- torch/torch_npu 及其设备运行时由目标环境替换；源环境中的 CANN/Ascend 本地安装包记录在 `manifest.json.excluded_packages`，不隐式携带到 CUDA 环境。torchvision/torchaudio 等关联构建也列为排除项；本批用例若需要它们，须另行提供与目标 nightly 匹配的安装方案。
+- torch/torch_npu 及其设备运行时由目标环境替换；源环境中的 CANN/Ascend 本地安装包记录在 `manifest.json.excluded_packages`，不隐式携带到 CUDA 环境。torchvision/torchaudio 等关联构建也列为排除项；本批用例若需要它们，须另行提供与目标 PyTorch 构建匹配的安装方案。
 - 其他 editable、直接 URL、本地私有包不能静默丢弃；准备阶段会停下并列出包名，调用方提供可迁移替代品，或在 `exclude_packages` 中逐包写明排除理由后再运行。
-- portable 包由约束文件锁住，安装后再次核对版本并执行 `pip check`。nightly 与锁定版本冲突时报告 blocked，不自动放宽版本。
+- portable 包由约束文件锁住，安装后再次核对版本并执行 `pip check`。目标 PyTorch 与锁定版本冲突时报告 blocked，不自动放宽版本。
 - helper 通过 `extra_paths` 明确声明；不为解决导入错误复制整个仓库。缺少系统库、编译工具、MPI 等非 Python 依赖时，保留日志并报告 blocked。
 
 ## 结果与状态

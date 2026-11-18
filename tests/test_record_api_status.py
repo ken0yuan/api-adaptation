@@ -48,6 +48,20 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(result['api-status'], {'torch.foo':'补充testcase'})
         self.assertEqual(result['next_steps'], {'torch.foo':'step1'})
 
+    def test_run_venv_selects_strategy_and_rejects_other_table(self):
+        (self.root/'basic_information.json').write_text(json.dumps({
+            'venv':'data/venv/torch-2.15.1/python-3.11.17'}))
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('CREATE TABLE "API支持数据_2.15" AS SELECT * FROM "API支持数据"')
+            c.execute('UPDATE "API支持数据_2.15" SET "适配策略"=? WHERE "API名称"=?', ('已支持','torch.foo'))
+        self.digest = hashlib.sha256(self.db.read_bytes()).hexdigest()
+        result = self.run_status('not_run')
+        self.assertEqual(result['api-status'], {'torch.foo':'支持'})
+        saved = self.adapt.read_bytes(), self.results.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'table mismatch'):
+            record_status(self.adapt, self.db, self.results, table='API支持数据')
+        self.assertEqual(saved, (self.adapt.read_bytes(), self.results.read_bytes()))
+
     def test_pass_finishes_api_and_hands_back_for_pr(self):
         result = self.run_status('pass')
         self.assertEqual(result['api-status'], {'torch.foo':'支持'})
