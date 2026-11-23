@@ -31,7 +31,7 @@
 
 先读取任务状态文件的 `api-status`。已记录的`待适配`或`支持`用于本批续跑，避免异常中断后再次按数据库中的旧`补充testcase`重新生成；没有本批状态时才按数据库策略分流。API可用性和正名仍以当前数据库核对。
 
-若已有结果中该 API 的 `next_step=step0.1`，优先继续尚未完成的生成或修复任务，沿用 `notes` 中的问题和原 API 身份。
+若已有result.json文件中该 API 的 `next_step=step0.1`，优先继续尚未完成的生成或修复任务，沿用 `notes` 中的问题和原 API 身份。不要重复开发。
 
 ### 2. 核对数据库条目
 
@@ -97,5 +97,5 @@ python3 <api-adaptation安装目录>/scripts/prepare_testcase_handoff.py --strat
    - 沿用调用方提供的数据库、源码、环境、开发分支、任务范围和结果目录，按本次已明确的缺口生成用例。
    - Step0.1 交付后，执行 [Step1：接收 NPU 结果，运行 GPU 并记录状态](step1-testcase_validation.md)。
    - 已有生成结果且无需补充用例的 API，按已有进度进入 Step1。
-2. 待适配项等本批 Step0.1 和 Step1 完成后，与测试失败后新增的待适配项一起交 [Step2：待适配入口](step2-scheme_design.md)。本批没有补测项时，直接交回待适配项。
+2. 待适配项与 Step1 确认需开发的失败项一起进入 [Step2：方案设计](step2-scheme_design.md)。本批没有补测项时直接进入 Step2。同批已有 `adaptation` 的项按已保存的路由恢复实施或验收。
 3. 已支持项由 [Step4：结果交回](step4-result_handoff.md) 汇总已有结论和材料。已有结论不能冒充新的执行记录。

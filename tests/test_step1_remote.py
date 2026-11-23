@@ -38,6 +38,32 @@ class RemoteTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'portable replacements'):
             controller.portable_packages([{'name': 'private-helper', 'version': '1', 'direct': {'url': 'file:///private/helper'}}], {})
 
+    def test_lint_packages_do_not_enter_runtime_requirements(self):
+        def package(name, *requires):
+            return {'name': name, 'version': '1', 'requires': requires}
+
+        installed = [
+            package('Flake8', 'pyflakes>=1', 'mccabe', 'pycodestyle'),
+            package('flake8-bugbear', 'flake8', 'attrs>=1'),
+            package('flake8-comprehensions', 'flake8'),
+            package('flake8-simplify', 'flake8'),
+            package('attrs'), package('pyflakes'), package('mccabe'), package('pycodestyle'),
+            package('pytest', 'attrs; extra == "dev"'),
+            package('torch-npu', 'attrs'),
+        ]
+        kept, omitted = controller.portable_packages(installed, {})
+        self.assertEqual(kept, {'pytest': '1'})
+        self.assertEqual(len(omitted), 9)
+
+        kept, _ = controller.portable_packages(installed + [package('test-helper', 'attrs>=1')], {})
+        self.assertEqual(kept, {'pytest': '1', 'test-helper': '1', 'attrs': '1'})
+
+        after_uninstall = [package('attrs'), package('torch-npu', 'attrs'), package('pytest')]
+        kept, _ = controller.portable_packages(after_uninstall, {})
+        self.assertEqual(kept, {'pytest': '1'})
+        kept, _ = controller.portable_packages(after_uninstall + [package('test-helper', 'attrs')], {})
+        self.assertEqual(kept['attrs'], '1')
+
     def test_paths_cannot_escape_source(self):
         with self.assertRaises(ValueError):
             controller.contained(self.root, '../outside.py')

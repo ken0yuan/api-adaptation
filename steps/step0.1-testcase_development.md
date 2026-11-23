@@ -46,6 +46,7 @@ python3 <api-adaptation安装目录>/scripts/prepare_testcase_handoff.py \
    - 提供本次两份源码、Python 环境、开发分支和结果目录。
    - 读取目标仓现有的 `test/api_supplement/README.md`，遵循其中的用例规范。
    - 按生成器现有主文档和类别规范完成自检，包括其要求的仓库 flake8。目标仓要求与模板冲突时，以目标仓为准修复本次用例。
+   - 代码风格检查使用独立工具虚拟环境。按目标仓规范用该环境的 `python -m pip install` 直接下载 flake8 和所需插件，再从目标仓目录用同一解释器执行 `python -m flake8`。测试环境和本批运行时依赖清单只用于执行用例。
    - 生成器只修改测试，沿用目标仓的命名和报告规范。
 3. 生成与 NPU 测试。
    - 明确交付“生成用例并在指定 NPU 环境执行”的任务，生成器负责执行、修复测试并重跑。

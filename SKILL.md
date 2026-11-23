@@ -34,7 +34,8 @@ description: 处理 PyTorch API 的 NPU 适配与测试用例补充。当用户�
 - [Step 0](steps/step0-testcase_check.md) 查询每个 API 的适配策略，结合本次任务已记录的状态确定下一步。
 - [Step 0.1](steps/step0.1-testcase_development.md) 按前序确定的计算类、框架类、分布式类或图模式类调用生成器编写功能用例，按任务要求在 NPU 上运行并保存报告。
 - [Step 1](steps/step1-testcase_validation.md) 核对 NPU 结果，按任务要求由本机代跑同一版用例的 GPU 测试，评估内存、精度、确定性的补测需求并更新逐 API 状态。
-- [Step 2](steps/step2-scheme_design.md) 将待适配 API 的当前状态、已有用例和测试材料交回调用方，结束本轮处理。
+- [Step 2](steps/step2-scheme_design.md) 从已有失败用例查目标入口和相邻实现，确定修改点及回归范围；缺少有效失败记录时才补最小复现。
+- [Step 3](steps/step3-code_development.md) 在本批开发分支实施方案，执行原失败用例及相关回归，交 Step1 核验结果。
 - [Step 4](steps/step4-result_handoff.md) 汇总逐 API 结果、验证材料和未完成事项，交回调用方。
 
 ## 输出

@@ -12,6 +12,7 @@ import sys
 import tempfile
 
 from adaptation_target import run_target, strategy_table
+from npu_handoff import record_lock, verify_evidence
 from prepare_testcase_handoff import representative
 
 INITIAL = {'补充testcase': '补充testcase', '待适配': '待适配', '已支持': '支持'}
@@ -38,6 +39,11 @@ def write_object(path, value):
 
 
 def record_status(adapt_information, database, results, *, table=None):
+    with record_lock(Path(results).resolve()):
+        return _record_status(adapt_information, database, results, table=table)
+
+
+def _record_status(adapt_information, database, results, *, table):
     adapt_path, results_path = Path(adapt_information).resolve(), Path(results).resolve()
     target = run_target(adapt_path.parent)
     table = strategy_table(table, target[0] if target else None)
@@ -74,6 +80,10 @@ def record_status(adapt_information, database, results, *, table=None):
             generation_pending = strategy == '补充testcase' and entry.get('next_step') == 'step0.1'
             if generation_pending:
                 status = '补充testcase'
+            elif entry.get('adaptation'):
+                if execution != 'not_run':
+                    verify_evidence(entry, adapt_path.parent)
+                status = '支持' if execution == 'pass' else '待适配'
             elif execution in {'pass', 'fail'}:
                 report = entry.get('report')
                 if not isinstance(report, str) or not report:
@@ -85,6 +95,8 @@ def record_status(adapt_information, database, results, *, table=None):
             entry['status'] = status
             if generation_pending:
                 entry['next_step'] = 'step0.1'
+            elif entry.get('adaptation') and status == '待适配':
+                entry['next_step'] = 'step3'
             elif execution in {'skip', 'blocked', 'partial'}:
                 entry['next_step'] = 'step1'
             elif status == '支持':

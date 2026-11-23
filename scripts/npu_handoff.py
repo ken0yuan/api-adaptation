@@ -30,6 +30,14 @@ def snapshot(args):
     snap = {'api': args.api, 'test_files': args.test_file, 'extra_paths': args.extra_path,
             'source': str(args.source), 'started_ns': time.time_ns()}
     snap['files'] = source_hashes(args.source, snap)
+    if getattr(args, 'results', None):
+        results = args.results.resolve()
+        row = entry_for(load(results), args.api)
+        if not row.get('adaptation') or row.get('next_step') not in ('step1', 'step3', 'step4'):
+            raise ValueError('实施验证需要已登记方案的 API')
+        design = row['adaptation']
+        check_design(design, results.parent.parent)
+        snap['adaptation_attempt'] = design['attempt']
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open('x', encoding='utf-8') as output:
         json.dump(snap, output, indent=2, ensure_ascii=False)
@@ -64,6 +72,10 @@ def verify_evidence(row, run_dir):
         if file_hash(evidence_path(run, name)) != expected:
             raise ValueError(f'NPU 交接材料已修改：{name}')
     snap = load(evidence_path(run, npu['snapshot']))
+    if row.get('adaptation'):
+        check_design(row['adaptation'], run)
+        if snap.get('adaptation_attempt') != row['adaptation']['attempt']:
+            raise ValueError('测试证据属于其他适配轮次')
     if (snap['api'] != row['api'] or snap['started_ns'] != npu['started_ns'] or snap['test_files'] != row['test_files']
             or snap['files'] != npu['handoff_files']):
         raise ValueError(f"{row['api']} 的测试范围与执行前快照不一致")
@@ -84,15 +96,53 @@ def record_lock(results):
         yield
 
 
+def check_design(design, run):
+    if file_hash(evidence_path(run, design['design'])) != design['sha256']:
+        raise ValueError('方案内容已变化，请保存新版方案并重新交接')
+
+
+def start_design(args, run):
+    path = evidence_path(run, args.design)
+    name = path.relative_to(run).as_posix()
+    digest = file_hash(path)
+    with record_lock(args.results):
+        data = load(args.results)
+        row = entry_for(data, args.api)
+        if row.get('next_step') not in ('step2', 'step3') or row.get('status') != '待适配':
+            raise ValueError('仅接收本批待适配并路由到 Step2/3 的 API')
+        previous = row.get('adaptation', {})
+        if previous.get('design') == name:
+            check_design(previous, run)
+            return previous['baseline']
+        # Reuse the Step1 failure, checking its recorded evidence before archiving it.
+        npu = row.get('device_validation', {}).get('npu', {})
+        if not previous and row.get('execution') == 'fail' and ('snapshot' in npu or 'artifacts' in npu):
+            verify_evidence(row, run)
+        attempt = uuid.uuid4().hex
+        archive = run / 'api-loop/adaptation' / attempt / 'before.json'
+        archive.parent.mkdir(parents=True)
+        write_json(archive, row)
+        baseline = archive.relative_to(run).as_posix()
+        row['adaptation'] = dict(attempt=attempt, design=name, sha256=digest, baseline=baseline)
+        row.update(next_step='step3', execution='not_run', report=None)
+        row['device_validation'] = {device: {'execution': 'not_run', 'report': None}
+                                    for device in ('npu', 'cuda')}
+        write_json(args.results, data)
+        return baseline
+
+
 def repair(args, run):
     if not args.reason.strip():
         raise ValueError('修复交接需要具体问题')
     with record_lock(args.results):
         data = load(args.results)
         row = entry_for(data, args.api)
+        if row.get('adaptation') and row.get('strategy') != '补充testcase':
+            raise ValueError('直接适配项的回归用例在 Step3 修复')
         archive = run / 'api-loop/repairs' / uuid.uuid4().hex / 'previous-result.json'
         archive.parent.mkdir(parents=True)
         write_json(archive, {'reason': args.reason, 'result': row})
+        row.pop('adaptation', None)
         row.setdefault('device_validation', {}).update(
             npu={'execution': 'not_run', 'report': None},
             cuda={'execution': 'not_run', 'report': None})
@@ -121,8 +171,13 @@ def record(args, run):
     with record_lock(args.results):
         data = load(args.results)
         row = entry_for(data, snap['api'])
-        if (row.get('generation') != 'generated' or row.get('strategy') != '补充testcase'
-                or row.get('test_files') != snap['test_files']):
+        design = row.get('adaptation')
+        if design or 'adaptation_attempt' in snap:
+            if not design or snap.get('adaptation_attempt') != design['attempt']:
+                raise ValueError('测试快照与本次适配方案不匹配')
+            check_design(design, run)
+        elif (row.get('generation') != 'generated' or row.get('strategy') != '补充testcase'
+              or row.get('test_files') != snap['test_files']):
             raise ValueError('快照中的 API 或测试文件与本次生成结果不匹配')
         devices = row.setdefault('device_validation', {})
         previous = devices.get('npu', {})
@@ -136,6 +191,7 @@ def record(args, run):
         if previous.get('handoff_files') != snap['files']:
             devices['cuda'] = {'execution': 'not_run', 'report': None}
         devices['npu'] = npu
+        row['test_files'] = snap['test_files']
         row.update(execution=args.execution, report=names['report'], next_step='step1')
         write_json(args.results, data)
     return names['report']
@@ -144,12 +200,14 @@ def record(args, run):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest='action', required=True)
-    for action in ('snapshot', 'record', 'verify', 'repair'):
+    for action in ('snapshot', 'record', 'verify', 'repair', 'design'):
         sub = actions.add_parser(action)
-        sub.add_argument('--source', type=Path, required=True)
+        if action != 'design':
+            sub.add_argument('--source', type=Path, required=True)
         if action != 'record':
             sub.add_argument('--api', required=True)
         if action == 'snapshot':
+            sub.add_argument('--results', type=Path, help='Step3: bind snapshot to the active design')
             sub.add_argument('--test-file', action='append', required=True)
             sub.add_argument('--extra-path', action='append', default=[])
             sub.add_argument('--output', type=Path, required=True)
@@ -162,15 +220,20 @@ def main():
             sub.add_argument('--execution', choices=('pass', 'fail', 'blocked', 'partial', 'skip'), required=True)
         if action == 'repair':
             sub.add_argument('--reason', required=True)
+        if action == 'design':
+            sub.add_argument('--design', required=True, help='Reviewed design file in this run')
     args = parser.parse_args()
-    args.source = args.source.resolve()
+    if args.action != 'design':
+        args.source = args.source.resolve()
     try:
         if args.action == 'snapshot':
             print(snapshot(args))
             return
         args.results = args.results.resolve()
         run = args.results.parent.parent
-        if args.action == 'record':
+        if args.action == 'design':
+            print(start_design(args, run))
+        elif args.action == 'record':
             print(record(args, run))
         elif args.action == 'repair':
             print(repair(args, run))

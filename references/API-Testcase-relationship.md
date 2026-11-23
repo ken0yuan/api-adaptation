@@ -1,5 +1,7 @@
 # 本批 API 与测试结果
 
+Step2 交接成功后，当前项新增 `adaptation`。其中 `design`、`baseline` 分别指向本次运行目录中的版本化设计文件与原始结果快照，`sha256` 标识设计内容，`attempt` 标识本轮方案。开发中的项为 `待适配 / step3`。Step3 实测快照通过 `adaptation_attempt` 绑定该方案，测试文件、NPU 报告及 GPU 结果沿用现有字段。同步状态时只依据本轮 NPU 结果；尚未通过的适配项继续 Step3。旧结果没有 `adaptation` 时沿用原分流。直接分流的适配回归计入验证结果，保持原 `strategy` 和 `generation`。
+
 当前不建立全仓 API—用例映射。只在任务结果目录的 `api-loop/result.json` 保存本次 API 的逐项结果，供续跑及调用方汇总。
 
 ```json

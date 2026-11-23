@@ -36,28 +36,78 @@ r=[]
 for d in m.distributions():
  try: direct=json.loads(d.read_text('direct_url.json') or '{}')
  except Exception: direct={}
- r.append({'name':d.metadata['Name'],'version':d.version,'direct':direct})
+ r.append({'name':d.metadata['Name'],'version':d.version,'direct':direct,'requires':d.requires or []})
 print(json.dumps({'python':list(sys.version_info[:3]),'packages':r}))'''
-    return json.loads(subprocess.check_output([str(python), '-c', code], text=True))
+    # Only the source site-packages baseline plus pre-existing PYTHONPATH
+    # entries (CANN python packages needed for exclusion detection) may enter
+    # the GPU export: strip just the NPU triton-ascend overlay injected by
+    # env.sh so it can never reach the GPU requirements.
+    clean_env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+    overlay = os.environ.get('PYTHONPATH')
+    if overlay:
+        kept_parts = [p for p in overlay.split(os.pathsep) if 'npu-inductor' not in p]
+        if kept_parts:
+            clean_env['PYTHONPATH'] = os.pathsep.join(kept_parts)
+    return json.loads(subprocess.check_output([str(python), '-c', code], text=True, env=clean_env))
+
+
+def portable_exclusion(item, name, exclude):
+    if name in {'torch', 'torch-npu', 'torchvision', 'torchaudio', 'torch-musa', 'triton'} or name.startswith('nvidia-'):
+        return 'Replaced by target PyTorch runtime'
+    if name in exclude:
+        return exclude[name]
+    url = item.get('direct', {}).get('url', '')
+    if any(s in url.lower() for s in ['/ascend/', '/selfgz', '/cann/']):
+        return 'Source Ascend/CANN installation; unavailable on CUDA host'
+    return None
+
+
+def lint_only_packages(packages, excluded):
+    dependencies = {}
+    for item in packages:
+        name = normalize(item['name'])
+        requires = dependencies.setdefault(name, set())
+        for requirement in item.get('requires', ()):
+            dependency = re.match(r'[A-Za-z0-9_.-]+', requirement.strip())
+            if dependency and 'extra' not in requirement.partition(';')[2]:
+                requires.add(normalize(dependency.group()))
+    lint = {name for name in dependencies if name == 'flake8' or name.startswith('flake8-')}
+    # Removing flake8 leaves its dependencies installed. In the NPU environment
+    # attrs can also be referenced by the CANN-only packages already excluded.
+    excluded_dependencies = set().union(*(dependencies.get(name, set()) for name in excluded))
+    lint_residue = {'attrs', 'mccabe', 'pycodestyle', 'pyflakes'} & excluded_dependencies
+
+    def closure(roots):
+        found = set()
+        pending = set(roots)
+        while pending:
+            name = pending.pop()
+            found.add(name)
+            pending.update(dependencies.get(name, set()) - found)
+        return found
+
+    lint_tree = closure(lint | lint_residue)
+    runtime_tree = closure(dependencies.keys() - lint_tree - excluded)
+    return lint | (lint_tree - runtime_tree)
 
 
 def portable_packages(packages, exclude):
     kept, omitted, unresolved = {}, [], []
+    excluded = {normalize(item['name']) for item in packages
+                if portable_exclusion(item, normalize(item['name']), exclude)}
+    lint_only = lint_only_packages(packages, excluded)
     for item in packages:
         name = normalize(item['name'])
-        url = item.get('direct', {}).get('url', '')
-        if name in {'torch', 'torch-npu', 'torchvision', 'torchaudio', 'torch-musa', 'triton'} or name.startswith('nvidia-'):
-            reason = 'Replaced by target PyTorch runtime'
-        elif name in exclude:
-            reason = exclude[name]
-        elif any(s in url.lower() for s in ['/ascend/', '/selfgz', '/cann/']):
-            reason = 'Source Ascend/CANN installation; unavailable on CUDA host'
-        elif item.get('direct'):
-            unresolved.append(item['name'])
-            continue
-        else:
-            kept[name] = item['version']
-            continue
+        reason = portable_exclusion(item, name, exclude)
+        if not reason:
+            if name in lint_only:
+                reason = 'Code style checker or dependency used only by the checker'
+            elif item.get('direct'):
+                unresolved.append(item['name'])
+                continue
+            else:
+                kept[name] = item['version']
+                continue
         omitted.append({'name': item['name'], 'version': item['version'], 'reason': reason})
     if unresolved:
         raise ValueError('Local/editable/URL packages need explicit portable replacements or exclude_packages reasons: ' + ', '.join(unresolved))
@@ -110,7 +160,8 @@ def export_inputs(config, data, manifest=None, *, legacy_subset=False):
     handoff = bool(manifest and manifest.get('npu_handoff')) or any(
         'handoff_files' in row.get('device_validation', {}).get('npu', {}) for row in rows)
     if handoff:
-        rows = [row for row in rows if row.get('strategy', '补充testcase') == '补充testcase']
+        rows = [row for row in rows if row.get('strategy', '补充testcase') == '补充testcase'
+                or row.get('adaptation') and 'handoff_files' in row.get('device_validation', {}).get('npu', {})]
     apis = config.get('apis')
     if legacy_subset and not handoff and apis is None:
         apis = [entry['api'] for entry in manifest['results']]

@@ -40,6 +40,8 @@ python3 <api-adaptation>/scripts/step1_remote.py prepare \
 
 依赖从源解释器导出可通用版本，由GPU 服务器重新安装对应架构的包。torch/torch_npu、设备运行时及CANN本地包按现有导出规则排除并记录原因；其他本地/editable/URL依赖须提供替代方案或在`exclude_packages`逐包说明原因，不能静默丢弃。缺依赖、系统库或多卡能力时记录实际限制。
 
+flake8、插件及它们专用的传递依赖从导出清单排除，原因记入 manifest。测试运行依赖共用的包继续随清单导出。
+
 Python 版本匹配源环境主次版本，当前支持 3.10～3.13。GPU 渠道为 `cu132` 或 `cu134`。固定版将示例的 `torch_index` 改为 `https://download.pytorch.org/whl/cu132` 或对应 cu134 地址。AI_LOOP 运行沿用 Step 0 在本次 `requirements.txt` 中写好的 torch 约束；独立运行在配置中填写 `torch_requirement` 为 `torch==<完整发行版本>`。提交脚本将该 pin 写入 GitHub 根目录 requirements.txt，runner 按原工作流复用 venv。回读验证报告时核对实测版本和 CUDA 渠道。未满足版本或依赖条件时交回补齐。
 
 服务器端AI不能操作本机时，交付配置、输出目录、导出包及本批API/文件列表，记录`cuda.execution=not_run`、`reason=awaiting_workstation_gpu`并留在Step1。服务器缺少GitHub登录本身不属于GPU执行失败。
