@@ -70,7 +70,7 @@ cat <torch_npu源码仓>/test/api_supplement/README.md
    - 实际运行该 API 的 `test_files`，并设置 `RUN_SUPPLEMENT_API_TESTS=1`。
    - 纯 Python、元信息等无硬件依赖的 API，按返回值、状态变化、副作用和异常行为判定。报告说明其执行不依赖 NPU 计算。
    - 确认 API 的本次全部测试均无设备依赖时，将其 `results[].api` 写入导出配置的 `device_independent_apis`。同一 API 含设备测试时保留设备核验。
-   - 需要设备执行的场景，核对实际后端。要求 NPU 的场景在 CPU 执行时，保留未完成 NPU 验证的事实。
+   - 逐 API 核对被测调用的实际后端。用例选错设备时，修正用例后复测；用例已选 NPU 且日志确认被测算子回退 CPU 时，本次 NPU 验收记为失败。CPU 参考值的计算属于正常对照。
    - Tensor 计算场景核对实际分配、计算和同步记录，设备状态或上下文类 API 按对应行为契约核对。
    - 所需场景实际执行且断言通过才记为通过。零用例、全跳过或仅安装冒烟按实际进度记录。
 4. 运行记录。
@@ -79,7 +79,7 @@ cat <torch_npu源码仓>/test/api_supplement/README.md
    - 缺包或导入失败时，保留具体阻塞原因。场景依赖 NPU 且 NPU 不可用时，记录该场景的阻塞。
    - 每次运行后核对实际设备、原始日志和逐项结果，退出码为 0 也要检查跳过和回退证据（如 `npu_cpu_fallback`）。要求 NPU 或 GPU 的用例如果选择了 CPU，或被测算子在运行时回退到 CPU，该场景不得计为真机通过，也不得上库。CPU 参考对照和明确标注的设备无关场景按原约定验收。
    - 发现失败、跳过、无法执行或回退时，保留受影响的用例、实际后端和原始日志，区分缺包、导入路径等环境问题与有证据的平台限制。缺包时记录缺项，交回环境准备环节补齐已知兼容依赖后用同一版用例复测，NPU 专用依赖只装在 NPU 环境。仍无法满足时保留原始结果和阻塞原因。
-   - 仅在具备与实测设备、软件版本和场景相符的证据后，才按平台限制流程记录设备型号、受限调用、限制依据和原始报告路径，交主控发布补测（见“汇总结果并更新状态”）。普通运行错误继续走原流程。
+   - 实测证据指向平台限制时，在该 API 的 `notes` 记录设备型号、软件版本、受限调用和原始报告路径，供后续适配和复测核对。
 5. 结果字段。
    - 沿用 Step0.1 登记的顶层 `execution`、`report` 和 `device_validation.npu`。
    - GPU 结果单独保存，保留有效的 NPU 结论。
@@ -138,7 +138,7 @@ python <脚本目录>/step1_wsl_gpu.py submit --bundle <唯一导出目录>/bund
 ```
 
 1. 入口创建唯一分支和单个测试提交，保存 Run ID、提交 SHA 和派发记录。
-2. 核对工作流选中了全部目标文件，附加设备审计插件，保持原始用例内容。
+2. 核对工作流选中了全部目标文件，在 unittest 收集时记录源码哈希和设备选择，保持原始用例内容。
 3. 本机无法访问 GitHub 时，按下一节请求调用方协助。
 
 ### 3. 本机无法访问 GitHub 时
@@ -184,11 +184,11 @@ python <脚本目录>/step1_wsl_gpu.py fetch --output <唯一GPU运行目录> --
 
 ### 5. 验收并导入报告
 
-1. 核对提交 SHA、`selected-files.txt`、`environment.txt`、`junit.xml`、设备审计及完整测试阶段。
+1. 核对提交 SHA、`selected-files.txt`、`environment.txt`、`junit.xml`、设备审计及逐条用例结果。
    - 测试文件和辅助文件的哈希必须与本次导出一致。
    - 纯 Python API 按实际语义断言核对，报告说明其不依赖 GPU 计算。
    - 需要 GPU 的场景，核对实际 CUDA 执行及设备证据。
-   - GPU 执行端以 pytest 收集 unittest 用例，保持生成器约定。
+   - GPU 新任务由 unittest 驱动。导入后，`cuda.report` 指向原始 `execution-result.json`，草稿和发布检查共用该回执。历史 pytest 归档仍读取原 `report.json`。
 2. 按逐 API 的实际结果判定。
    - 所需场景实际执行且断言通过，才记为通过。未选中、零用例或仅收集成功时保留未完成事实。
    - 环境准备失败、缺少凭据、执行端离线、缺报告或传输中断记为 `blocked`。
@@ -219,7 +219,9 @@ python <脚本目录>/step1_wsl_gpu.py import --config <导出配置> --output <
 
 ### 2. 同步本批状态
 
-本批要求的验证结束并落盘后，执行状态脚本。补测中若已确认目标平台不支持某场景，在该 API 的 `notes` 记录设备型号、受限调用、限制依据和原始报告路径，保留实测结论并交主控发布补测 PR。GPU 参考验证按原流程继续，尚在运行时如实交接进度，结果回填同一 PR。
+日志已确认被测算子回退 CPU 时，子 agent 直接在本批 `api-loop/result.json` 的 `results[]` 中按 `api` 找到对应条目，将 `execution` 和 `device_validation.npu.execution` 一并更正为 `fail`。在该条目的 `notes` 中注明被测算子、用例和现有日志位置。
+
+沿用本次快照、报告和原始日志，直接运行以下状态脚本。待测试或实现修复后，再对改动进行复测。
 
 ```bash
 python3 <api-adaptation安装目录>/scripts/record_api_status.py \
@@ -228,8 +230,10 @@ python3 <api-adaptation安装目录>/scripts/record_api_status.py \
   --results <本次api-loop/result.json绝对路径>
 ```
 
-1. 同批还有 API 等待 GPU 时，通常在收到结果或记录实际阻塞原因后同步。符合平台限制发布条件的补测批次，先按已有 NPU 结论同步并交接。
-2. 脚本读取整份结果文件，依据各 API 的顶层 NPU 结论更新任务状态文件的 `api-status`。
+1. 同批还有 API 等待 GPU 时，通常在收到结果或记录实际阻塞原因后同步。
+2. 子 agent 执行脚本后回读两个文件，逐 API 核对写回值：
+   - 在 `api-loop/result.json` 中回读同一条目。确认回退时，`status` 应为 `待适配`；首次发现实现缺口时 `next_step` 应为 `step2`，已有 `adaptation` 的实施复测仍回退时应为 `step3`。已按本步要求验证通过的项应为 `status=支持`、`next_step=step4`。
+   - 在本批 `adapt-information.json` 中，核对 `api-status["<数据库正名>"]` 与上述条目的 `status` 一致。正名按策略表解析，结果条目有 `database_api` 时使用该值核对。
    - `next_step=step0.1` 的待生成或待修复项保持该去向，并将本批状态更新为 `补充testcase`，避免旧的支持状态覆盖修复任务。
    - `pass`、`fail` 必须有实际执行报告，报告路径相对结果目录。
    - `strategy` 保留最初数据库策略。
@@ -241,8 +245,8 @@ python3 <api-adaptation安装目录>/scripts/record_api_status.py \
 | 有效 NPU 结论 | 本批状态 | 后续 |
 |---|---|---|
 | 通过 | `支持` | Step4 汇总，向调用方交付 GPU 结果或阻塞原因 |
-| 失败 | `待适配` | 明确平台限制的补测项可直接交主控发布；其他失败携带两侧证据及差异分析交 Step2 |
-| 未运行、跳过、阻塞或部分完成 | 保留原状态，新补测项保持 `补充testcase` | 已按上述规则确认平台限制的补测项可交主控发布；其他情况留在 Step1，保留尚缺材料和原因 |
+| 失败 | `待适配` | 首次发现的实现缺口交 Step2；已有适配实现的复测失败回 Step3 |
+| 未运行、跳过、阻塞或部分完成 | 保留原状态，新补测项保持 `补充testcase` | 留在 Step1，保留尚缺材料和原因 |
 
 ## 其他入口与测试范围
 

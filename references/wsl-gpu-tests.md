@@ -102,9 +102,9 @@ python <本机scripts>/step1_wsl_bridge.py fetch --config <本机bridge.json> --
 
 ## 3. 结果核对和服务器导入
 
-设备审计插件随测试提交，核对 `RUN_SUPPLEMENT_API_TESTS=1`、源文件哈希、实际 PyTorch 版本、CUDA 和 GPU 及测试 setup/call/teardown 结果。设备相关 API 还须满足模块 `DEVICE_NAME=cuda`，已确认无设备依赖的 API 按 manifest 中的标记核验。GPU 型号记录实际值。Runner 仍用 pytest 收集 unittest 用例。
+临时测试分支使用工作流原有的 unittest 入口，收集时记录 `RUN_SUPPLEMENT_API_TESTS`、逐文件 SHA256、PyTorch 版本和实际设备。设备相关 API 还须满足模块 `DEVICE_NAME=cuda`，已确认无设备依赖的 API 按 manifest 中的标记核验。GPU 型号记录实际值。历史 pytest 报告继续使用原有的逐阶段审计。
 
-本机结合`commit.txt`、`selected-files.txt`、`environment.txt`、`packages.txt`、`junit.xml`、`test-output.tar.gz`中的`step1-audit.json`及失败日志生成`evidence/report.json`，逐API统计通过、失败、跳过数。零用例、选测缺失或跳过时按实际进度记录。纯 Python API 核对实际语义断言；需要 GPU 的场景回退 CPU 或缺少设备证据时，记录该场景验证未完成。Runner离线、安装或报告缺失记录阻塞及恢复入口。两个设备均通过不等于输出逐项相等，精确比对须由用例携带参考数据并断言。
+本机结合`commit.txt`、`selected-files.txt`、`environment.txt`、`packages.txt`、`junit.xml`、`test-output.tar.gz`中的`step1-audit.json`及失败日志生成`evidence/report.json`，按所选用例 ID 和 JUnit 统计每个 API 的通过、失败、跳过数。unittest 的原始 `execution-result.json` 与来源核对文件 `source-files.json` 一起归档，导入时将原始回执路径写入 `cuda.report`。零用例、选测缺失或跳过时按实际进度记录。纯 Python API 核对实际语义断言；需要 GPU 的场景回退 CPU 或缺少设备证据时，记录该场景验证未完成。Runner离线、安装或报告缺失记录阻塞及恢复入口。两个设备均通过不等于输出逐项相等，精确比对须由用例携带参考数据并断言。
 
 回传后服务器调用`step1_wsl_gpu.py import`核对manifest、运行编号、提交SHA、本次API及文件范围，并检查源文件未变化。仅更新`api-loop/result.json.device_validation.cuda`，保留NPU顶层`execution/report`、已有CPU证据和任务状态。
 

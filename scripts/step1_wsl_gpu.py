@@ -100,16 +100,12 @@ def bundle_files(bundle):
                 raise ValueError('Missing API test files')
             if any(not (PurePosixPath(p).name.startswith('test_') or PurePosixPath(p).name.endswith('_test.py')) for p in entry['test_files']):
                 raise ValueError('Test file cannot be selected by WSL workflow')
-        for name in ['step1_gpu_audit.py', 'pytest.ini', 'step1-manifest.json']:
-            if name in files:
-                raise ValueError('Bundle collides with relay metadata')
         dependencies = archive.read('requirements.txt')
         if requirement != 'torch':
             dependencies = (requirement + '\n').encode() + dependencies
         files['requirements.txt'] = dependencies
     files['step1-manifest.json'] = raw
-    files['step1_gpu_audit.py'] = Path(__file__).with_name('step1_gpu_audit.py').read_bytes()
-    files['pytest.ini'] = b'[pytest]\naddopts = -p step1_gpu_audit\n'
+    files['ci/run-unittests.py'] = Path(__file__).with_name('step1_unittest_audit.py').read_bytes()
     return manifest, raw, files
 
 
@@ -121,7 +117,7 @@ def submit(bundle, output, branch):
     manifest, raw, files = bundle_files(bundle)
     output.mkdir(parents=True)
     (output / 'manifest.json').write_bytes(raw)
-    state = {'repository': REPO, 'workflow': WORKFLOW, 'branch': branch,
+    state = {'repository': REPO, 'workflow': WORKFLOW, 'branch': branch, 'driver': 'unittest',
              'python_version': '.'.join(map(str, manifest['python_minor'])),
              'cuda_build': manifest['torch_index'].rsplit('/', 1)[-1], 'phase': 'preparing'}
     write_json(output / 'submission.json', state)
@@ -133,7 +129,8 @@ def submit(bundle, output, branch):
         raise ValueError('Base tree truncated; cannot verify selected tests')
     lookup = {x['path']: x['sha'] for x in base_files['tree'] if x['type'] == 'blob'}
     changed = set()
-    entries = []
+    entries = [{'path': 'ci/step1_original_unittests.py', 'mode': '100644', 'type': 'blob',
+                'sha': lookup['ci/run-unittests.py']}]
     import base64
     for name, data in files.items():
         sha = api('git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})['sha']
@@ -161,6 +158,33 @@ def submit(bundle, output, branch):
     return state
 
 
+def unittest_counts(artifact, receipt, selected):
+    """Match each reported method to the workflow selection and raw JUnit."""
+    if (not receipt['test_started'] or not receipt['junit_generated'] or receipt['device_kind'] != 'GPU'
+            or set(receipt['selected_files']) != selected
+            or receipt['test_exit_code'] != int((artifact / 'test-exit-code.txt').read_text())):
+        raise ValueError('Unittest receipt does not match the run')
+    ids = (artifact / 'selected-test-ids.txt').read_text().splitlines()
+    observed = {}
+    totals = dict.fromkeys(('tests', 'failures', 'errors', 'skipped'), 0)
+    counts = {file: dict(passed=0, failed=0, skipped=0) for file in selected}
+    for case in ET.parse(artifact / 'junit.xml').iter('testcase'):
+        name = case.attrib['classname'] + '.' + case.attrib['name']
+        file = case.get('file')
+        if name in observed or file not in selected or not name.startswith(file[:-3].replace('/', '.') + '.'):
+            raise ValueError('Unmatched or duplicate unittest case: ' + name)
+        observed[name] = file
+        tag = next((k for k in ('failure', 'error', 'skipped') if case.find(k) is not None), None)
+        counts[file][{'failure': 'failed', 'error': 'failed', 'skipped': 'skipped', None: 'passed'}[tag]] += 1
+        totals['tests'] += 1
+        if tag:
+            totals[{'failure': 'failures', 'error': 'errors', 'skipped': 'skipped'}[tag]] += 1
+    if (totals != receipt['junit'] or len(ids) != len(observed) or set(ids) != set(observed)
+            or (receipt['test_exit_code'] != 0 and not (totals['errors'] or totals['failures']))):
+        raise ValueError('Unittest selection, JUnit totals or exit status disagree')
+    return counts
+
+
 def analyze(manifest_bytes, state, run, artifact):
     manifest = json.loads(manifest_bytes)
     if run['head_sha'] != state['head_sha'] or run['head_branch'] != state['branch'] or run['event'] != 'workflow_dispatch':
@@ -171,6 +195,8 @@ def analyze(manifest_bytes, state, run, artifact):
               'branch': state['branch'], 'head_sha': state['head_sha'],
               'workflow_conclusion': run.get('conclusion'), 'environment': {}, 'results': []}
     audit, selected, reason = {}, set(), ''
+    native_counts = None
+    receipt_path = artifact / 'execution-result.json'
     try:
         if (artifact / 'commit.txt').read_text().strip() != state['head_sha']:
             raise ValueError('Artifact commit does not match submitted SHA')
@@ -194,7 +220,16 @@ def analyze(manifest_bytes, state, run, artifact):
             raise ValueError('CUDA channel mismatch')
         report['environment'] = env
         # Retain JUnit as independent raw evidence and require it to parse.
-        ET.parse(artifact / 'junit.xml')
+        if state.get('driver') == 'unittest' or (artifact / 'unittest-summary.json').is_file():
+            receipt = json.loads(receipt_path.read_bytes())
+            if (receipt['torch_version'], receipt['cuda_version'], receipt['device_model']) != (
+                    env['torch'], env['cuda_build'], env['gpu_name']):
+                raise ValueError('Unittest environment and device audit disagree')
+            if any(audit['files'].get(f, {}).get('sha256') != h for f, h in manifest['files'].items()):
+                raise ValueError('Unittest source hashes differ from the export')
+            native_counts = unittest_counts(artifact, receipt, selected)
+        else:
+            ET.parse(artifact / 'junit.xml')
     except (OSError, ValueError, KeyError, tarfile.TarError, ET.ParseError) as error:
         reason = str(error)
     for entry in manifest['results']:
@@ -206,10 +241,15 @@ def analyze(manifest_bytes, state, run, artifact):
             item = {'file': file, 'sha256': manifest['files'][file], 'execution': 'blocked',
                     'counts': {'passed': 0, 'failed': 0, 'skipped': 0}}
             info = audit.get('files', {}).get(file, {})
+            collected = sum(native_counts.get(file, {}).values()) if native_counts is not None else info.get('collected')
             if (reason or file not in selected or info.get('sha256') != item['sha256']
                     or not device_independent and info.get('selected_device') != 'cuda'
-                    or not info.get('collected')):
+                    or not collected):
                 item['reason'] = reason or 'Missing selection, collected tests, matching source hash or required CUDA evidence'
+            elif native_counts is not None:
+                counts = item['counts'] = native_counts[file]
+                item['execution'] = 'fail' if counts['failed'] else 'partial' if counts['skipped'] else 'pass'
+                item['selected_device'] = info.get('selected_device')
             else:
                 records = {}
                 for record in audit.get('reports', []):
@@ -237,6 +277,13 @@ def analyze(manifest_bytes, state, run, artifact):
         report['results'].append(result)
     states = [e['execution'] for e in report['results']]
     report['execution'] = 'fail' if 'fail' in states else 'blocked' if 'blocked' in states else 'partial' if 'partial' in states else 'pass'
+    if native_counts is not None:
+        verified = {f['file'] for item in report['results'] for f in item['files'] if f['execution'] != 'blocked'}
+        independent = {f for e in manifest['results'] if e.get('device_independent') for f in e['test_files']}
+        write_json(artifact / 'source-files.json', dict(head_sha=state['head_sha'], run_id=run['id'],
+                   receipt_sha256=digest(receipt_path.read_bytes()), junit_sha256=digest((artifact / 'junit.xml').read_bytes()),
+                   file_hashes=manifest['files'], verified_files=sorted(verified), independent_files=sorted(independent)))
+        report['unittest_receipt'] = True
     if reason:
         report['reason'] = reason
     return report
@@ -301,6 +348,10 @@ def _merge(config, output, path):
     if report['head_sha'] != state['head_sha'] or report['run_id'] != state['run_id']:
         raise ValueError('Returned report run/SHA mismatch')
     run_dir = Path(config['run_dir']).resolve()
+    if report.get('unittest_receipt'):
+        report_path = report_path.parent / ('artifacts-' + str(report['run_attempt'])) / 'execution-result.json'
+        if not report_path.is_file() or not report_path.with_name('source-files.json').is_file():
+            raise ValueError('Missing original unittest receipt or source proof')
     relative_report = report_path.resolve().relative_to(run_dir).as_posix()
     result = json.loads(path.read_text(encoding='utf-8'))
     export_inputs(config, result, manifest, legacy_subset=True)

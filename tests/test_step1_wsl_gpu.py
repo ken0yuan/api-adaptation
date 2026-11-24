@@ -193,6 +193,37 @@ class WslTests(unittest.TestCase):
             merge(config, output)
         self.assertEqual(path.read_bytes(), before)
 
+    def test_unittest_import_uses_original_receipt_and_checks_selection(self):
+        import shutil
+        self.state['driver'] = 'unittest'
+        receipt = self.artifact / 'execution-result.json'
+        write_json(receipt, dict(device_kind='GPU', test_started=True, junit_generated=True, test_exit_code=0,
+                   torch_version=self.audit['environment']['torch'], cuda_version='13.2',
+                   device_model=self.audit['environment']['gpu_name'], selected_files=[self.file],
+                   junit=dict(tests=1, failures=0, errors=0, skipped=1)))
+        (self.artifact / 'test-exit-code.txt').write_text('0')
+        ids = self.artifact / 'selected-test-ids.txt'
+        ids.write_text('test.test_sample.C.test_ok')
+        (self.artifact / 'junit.xml').write_text('<testsuite><testcase file="test/test_sample.py" '
+                'classname="test.test_sample.C" name="test_ok"><skipped/></testcase></testsuite>')
+        report = self.report()
+        self.assertEqual(report['execution'], 'partial')
+        proof = json.loads((self.artifact / 'source-files.json').read_bytes())
+        self.assertEqual(proof['verified_files'], [self.file])
+        self.assertEqual(proof['receipt_sha256'], hashlib.sha256(receipt.read_bytes()).hexdigest())
+        output = self.root / 'run/export'
+        shutil.copytree(self.artifact, output / 'evidence/artifacts-1')
+        (output / 'manifest.json').write_bytes(self.raw)
+        write_json(output / 'submission.json', self.state)
+        write_json(output / 'evidence/report.json', report)
+        result = output.parent / 'result.json'
+        write_json(result, dict(results=self.manifest['results']))
+        merge(dict(source_root=str(self.source), run_dir=str(output.parent), results=str(result)), output)
+        cuda = json.loads(result.read_bytes())['results'][0]['device_validation']['cuda']
+        self.assertEqual((output.parent / cuda['report']).read_bytes(), receipt.read_bytes())
+        ids.write_text('test.test_sample.C.test_another')
+        self.assertEqual(self.report()['execution'], 'blocked')
+
     def test_existing_submission_cannot_be_dispatched_again(self):
         with self.assertRaisesRegex(ValueError, 'use fetch'):
             submit(self.root / 'unused.zip', self.artifact, 'check/sample')

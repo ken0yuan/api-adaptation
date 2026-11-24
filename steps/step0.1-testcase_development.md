@@ -77,7 +77,7 @@ python3 <api-adaptation安装目录>/scripts/npu_handoff.py snapshot \
 
 ### 生成器执行、修复和保存报告
 
-1. 生成器使用指定 Python，设置 `RUN_SUPPLEMENT_API_TESTS=1`，执行该 API 的全部测试，保存原始输出和退出码。环境及设备按 [NPU 验收条件](step1-testcase_validation.md#npu-验收条件) 核对。
+1. 每次运行（含重跑），将 `ATTEMPT` 指向本批运行目录下本次尝试目录的绝对路径。生成器加载指定环境后，以 `ASCEND_WORK_PATH="$ATTEMPT" RUN_SUPPLEMENT_API_TESTS=1` 启动指定 Python 测试进程，执行该 API 的全部测试，保存原始输出和退出码。环境及设备按 [NPU 验收条件](step1-testcase_validation.md#npu-验收条件) 核对。
 2. 生成器修正用例后，在新尝试目录重新保存快照并运行。Step1 明确要求修复重跑的项使用新结果，普通同批续跑可复用仍有效的报告。
 3. 将原始日志和生成器的 `UT_REPORT.md` 原样保存到同次尝试目录。生成器交付汇总报告 `test/UT_EXECUTION_REPORT.md` 时，核对其中该 API 的逐用例结果并保存原报告。
 4. 环境使测试无法启动时，保留已生成用例的快照和具体阻塞记录，NPU 记为 `blocked`。
