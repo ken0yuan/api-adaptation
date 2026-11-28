@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import time
 import uuid
+import xml.etree.ElementTree as ET
 
 from step1_remote import collect_files, write_json
 
@@ -33,7 +34,7 @@ def snapshot(args):
     if getattr(args, 'results', None):
         results = args.results.resolve()
         row = entry_for(load(results), args.api)
-        if not row.get('adaptation') or row.get('next_step') not in ('step1', 'step3', 'step4'):
+        if not row.get('adaptation') or row.get('next_step') not in ('step0.1', 'step1', 'step3', 'step3.1', 'step4'):
             raise ValueError('实施验证需要已登记方案的 API')
         design = row['adaptation']
         check_design(design, results.parent.parent)
@@ -63,6 +64,8 @@ def verify_evidence(row, run_dir):
     run = Path(run_dir).resolve()
     npu = row['device_validation']['npu']
     required = {npu['snapshot'], npu['report']}
+    for evidence in npu.get('unittest_files', {}).values():
+        required.update((evidence['xml'], evidence['receipt']))
     if npu['execution'] != 'blocked' or npu.get('log'):
         required.add(npu['log'])
     if (row.get('execution') != npu['execution'] or row.get('report') != npu['report']
@@ -112,6 +115,8 @@ def start_design(args, run):
             raise ValueError('仅接收本批待适配并路由到 Step2/3 的 API')
         previous = row.get('adaptation', {})
         if previous.get('design') == name:
+            if previous.get('revision_reason'):
+                raise ValueError('请登记修订后的新方案文件')
             check_design(previous, run)
             return previous['baseline']
         # Reuse the Step1 failure, checking its recorded evidence before archiving it.
@@ -131,25 +136,30 @@ def start_design(args, run):
         return baseline
 
 
-def repair(args, run):
-    if not args.reason.strip():
+def mark_for_repair(row, run, reason):
+    if not reason.strip():
         raise ValueError('修复交接需要具体问题')
+    archive = run / 'api-loop/repairs' / uuid.uuid4().hex / 'previous-result.json'
+    archive.parent.mkdir(parents=True)
+    write_json(archive, {'reason': reason, 'result': row})
+    if row.get('adaptation'):
+        row['adaptation'].pop('review', None)
+    row.setdefault('device_validation', {}).update(
+        npu={'execution': 'not_run', 'report': None},
+        cuda={'execution': 'not_run', 'report': None})
+    status = '待适配' if row.get('strategy') == '待适配' else '补充testcase'
+    row.update(execution='not_run', report=None, status=status, next_step='step0.1',
+               repair_requested_ns=time.time_ns(), notes=reason)
+    return str(archive)
+
+
+def repair(args, run):
     with record_lock(args.results):
         data = load(args.results)
         row = entry_for(data, args.api)
-        if row.get('adaptation') and row.get('strategy') != '补充testcase':
-            raise ValueError('直接适配项的回归用例在 Step3 修复')
-        archive = run / 'api-loop/repairs' / uuid.uuid4().hex / 'previous-result.json'
-        archive.parent.mkdir(parents=True)
-        write_json(archive, {'reason': args.reason, 'result': row})
-        row.pop('adaptation', None)
-        row.setdefault('device_validation', {}).update(
-            npu={'execution': 'not_run', 'report': None},
-            cuda={'execution': 'not_run', 'report': None})
-        row.update(execution='not_run', report=None, status='补充testcase', next_step='step0.1',
-                   notes=args.reason)
+        archive = mark_for_repair(row, run, args.reason)
         write_json(args.results, data)
-    return str(archive)
+    return archive
 
 
 def record(args, run):
@@ -168,10 +178,46 @@ def record(args, run):
     names = {key: p.relative_to(run).as_posix() for key, p in paths.items()}
     npu = dict(names, execution=args.execution, started_ns=snap['started_ns'], handoff_files=snap['files'],
                artifacts={names[key]: file_hash(p) for key, p in paths.items()})
+    unittest_files = {}
+    for filename in snap['test_files']:
+        folder = snap_path.parent / 'unittest' / filename
+        receipt = folder / 'execution-result.json'
+        if not receipt.is_file():
+            if getattr(args, 'require_junit', False) and args.execution in ('pass', 'skip'):
+                raise ValueError(f'缺少本次 unittest 回执：{filename}')
+            continue
+        data = load(receipt)
+        if (data.get('file_hashes') != {filename: snap['files'][filename]}
+                or data.get('selected_files') != [filename] or data.get('junit_generated') is not True):
+            raise ValueError(f'unittest 回执与执行前快照不符：{filename}')
+        xml_path = evidence_path(run, folder / 'junit.xml')
+        try:
+            suites = list(ET.parse(xml_path).iter('testsuite'))
+            counts = {k: sum(int(s.attrib[k]) for s in suites)
+                      for k in ('tests', 'errors', 'failures', 'skipped')}
+        except (ET.ParseError, KeyError, ValueError) as exc:
+            raise ValueError(f'无效的 JUnit XML：{filename}') from exc
+        if not suites or data.get('junit') != counts:
+            raise ValueError(f'JUnit 统计与回执不一致：{filename}')
+        if args.execution == 'pass' and (data.get('test_exit_code') != 0 or not counts['tests']
+                                         or any(counts[k] for k in ('errors', 'failures', 'skipped'))):
+            raise ValueError(f'JUnit 实测结果与 pass 不符：{filename}')
+        item = {}
+        for key, file in [('xml', folder / 'junit.xml'), ('receipt', receipt)]:
+            relative = evidence_path(run, file).relative_to(run).as_posix()
+            item[key] = relative
+            npu['artifacts'][relative] = file_hash(file)
+        unittest_files[filename] = item
+    if unittest_files:
+        npu['unittest_files'] = unittest_files
     with record_lock(args.results):
         data = load(args.results)
         row = entry_for(data, snap['api'])
+        if snap['started_ns'] <= row.get('repair_requested_ns', 0):
+            raise ValueError('此快照早于用例返修，请补用例并重新执行')
         design = row.get('adaptation')
+        if design and design.get('revision_reason'):
+            raise ValueError('当前方案已退回 Step2，请先登记新版方案')
         if design or 'adaptation_attempt' in snap:
             if not design or snap.get('adaptation_attempt') != design['attempt']:
                 raise ValueError('测试快照与本次适配方案不匹配')
@@ -190,6 +236,8 @@ def record(args, run):
             raise ValueError('已经登记更新的 NPU 尝试，不能用旧报告覆盖')
         if previous.get('handoff_files') != snap['files']:
             devices['cuda'] = {'execution': 'not_run', 'report': None}
+        if design:
+            design.pop('review', None)
         devices['npu'] = npu
         row['test_files'] = snap['test_files']
         row.update(execution=args.execution, report=names['report'], next_step='step1')
@@ -214,6 +262,7 @@ def main():
         else:
             sub.add_argument('--results', type=Path, required=True)
         if action == 'record':
+            sub.add_argument('--require-junit', action='store_true', help='Require per-file XML for completed pass/skip runs')
             sub.add_argument('--snapshot', required=True)
             sub.add_argument('--report', required=True)
             sub.add_argument('--log')

@@ -240,6 +240,13 @@ def prepare(config, output):
                 'timeout_per_file': int(config.get('timeout_per_file', 300)), 'install_timeout': int(config.get('install_timeout', 1800))}
     if handoff:
         manifest['npu_handoff'] = True
+        selected = {entry['api'] for entry in entries}
+        manifest['npu_snapshots'] = {}
+        for row in results['results']:
+            if row['api'] in selected:
+                npu = row['device_validation']['npu']
+                name = npu['snapshot']
+                manifest['npu_snapshots'][row['api']] = {'path': name, 'sha256': npu['artifacts'][name]}
     for key, command in [('source_commit', ['git', '-C', str(root), 'rev-parse', 'HEAD']), ('source_branch', ['git', '-C', str(root), 'branch', '--show-current'])]:
         try:
             manifest[key] = subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL).strip()

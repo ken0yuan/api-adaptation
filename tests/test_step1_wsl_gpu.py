@@ -228,6 +228,130 @@ class WslTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'use fetch'):
             submit(self.root / 'unused.zip', self.artifact, 'check/sample')
 
+    def test_fresh_handoff_registers_before_pr_and_stale_return_cannot_overwrite(self):
+        from record_api_status import gpu_request_problem
+        from test_record_api_status import write_coverage
+
+        run = self.root / 'AI_LOOP/data/run_data/batch'
+        out = run / 'api-loop/reports/first'
+        run.mkdir(parents=True)
+        result = run / 'api-loop/result.json'
+        result.parent.mkdir()
+        cfg = result.with_name('wsl-export.json')
+        config = dict(device='cuda', source_root=str(self.source), source_python=sys.executable,
+                      run_dir=str(run), results=str(result), torch_index='https://download.pytorch.org/whl/nightly/cu132')
+        write_json(cfg, config)
+        api = 'torch.sample'
+        files = self.manifest['files']
+        snap = run / 'snapshot.json'
+        write_json(snap, dict(api=api, started_ns=1, test_files=[self.file], extra_paths=[], files=files))
+        (run/'report').write_bytes(b'failed on NPU')
+        (run/'log').write_bytes(b'log')
+        npu = dict(snapshot=snap.name, report='report', log='log', execution='fail', started_ns=1,
+                   handoff_files=files, artifacts={n: hashlib.sha256((run/n).read_bytes()).hexdigest()
+                                                  for n in [snap.name, 'report', 'log']})
+        row = dict(api=api, test_files=[self.file], execution='fail', report='report', device_validation={'npu': npu})
+        write_json(result, {'results': [row]})
+        inventory = dict(python=[3, 11], packages=[])
+        with patch('step1_remote.inventory', return_value=inventory):
+            with self.assertRaisesRegex(ValueError, 'Step 1'):
+                request(cfg, out)
+            self.assertFalse((out/'step1-request.json').exists())
+            write_coverage(snap, api, self.file)
+            write_json(result, {'results': [row]})
+            ticket = request(cfg, out)
+            self.assertEqual(request(cfg, out)['request_id'], ticket['request_id'])
+        row = json.loads(result.read_bytes())['results'][0]
+        self.assertIsNone(gpu_request_problem(row, run))
+        self.assertFalse((run/'pr.json').exists())
+        self.raw = (out/'manifest.json').read_bytes()
+        self.manifest = json.loads(self.raw)
+        self.audit['manifest_sha256'] = hashlib.sha256(self.raw).hexdigest()
+        (out/'evidence').mkdir()
+        write_json(out/'submission.json', self.state)
+        write_json(out/'evidence/report.json', self.report())
+        (self.source/self.file).unlink()  # Simulate switching the checkout after export.
+        self.assertEqual(merge(config, out)['status'], 'GPU_RESULTS_IMPORTED')
+        row['device_validation']['npu']['handoff_files'] = {self.file: 'repaired'}
+        write_json(result, {'results': [row]})
+        before = result.read_bytes()
+        self.assertEqual(merge(config, out)['status'], 'GPU_RESULTS_SUPERSEDED')
+        self.assertEqual(result.read_bytes(), before)
+
+    def test_auto_route_waits_downloads_then_imports_without_another_command(self):
+        import step1_wsl_gpu as gpu
+        from contextlib import ExitStack
+
+        out = self.root / 'batch'
+        out.mkdir()
+        (out/'manifest.json').write_bytes(self.raw)
+        cfg = self.root / 'config.json'
+        write_json(cfg, dict(run_dir=str(self.root), results=str(self.root/'results.json'), device='cuda'))
+        calls = []
+
+        def submit(bundle, direct, branch):
+            calls.append('submit')
+            direct.mkdir()
+            (direct/'manifest.json').write_bytes(self.raw)
+            write_json(direct/'submission.json', dict(run_id=17, phase='dispatched', branch=branch))
+
+        states = iter(['queued', 'completed', 'completed'])
+        def api(path):
+            self.assertEqual(path, 'actions/runs/17')
+            status = next(states)
+            calls.append(status)
+            return dict(id=17, status=status, run_attempt=1, conclusion='success')
+
+        def gh(*args, **kwargs):
+            calls.append('probe' if args[0] == 'api' else 'download')
+            return '42'
+
+        with ExitStack() as stack:
+            for name, function in [('submit', submit), ('api', api), ('gh', gh)]:
+                stack.enter_context(patch.object(gpu, name, side_effect=function))
+            stack.enter_context(patch.object(gpu, 'accepted_rows'))
+            stack.enter_context(patch.object(gpu, 'bundle_files', return_value=(self.manifest, self.raw, {})))
+            stack.enter_context(patch.object(gpu, 'analyze', return_value=dict(run_id=17, run_attempt=1, execution='fail')))
+            merge = stack.enter_context(patch.object(gpu, 'merge', return_value={'status':'GPU_RESULTS_IMPORTED'}))
+            stack.enter_context(patch.object(gpu.time, 'sleep'))
+            assist = stack.enter_context(patch.object(gpu, 'request'))
+            result = gpu.run_gpu(cfg, out)
+            self.assertEqual(calls, ['probe','submit','queued','completed','download'])
+            self.assertEqual((result['run_id'], result['execution']), (17, 'fail'))
+            calls.clear()
+            gpu.run_gpu(cfg, out)
+            self.assertEqual(calls, ['completed'])
+            self.assertEqual(merge.call_count, 2)
+            assist.assert_not_called()
+
+    def test_auto_route_falls_back_before_dispatch_but_recovers_a_lost_response(self):
+        import step1_wsl_gpu as gpu
+        from contextlib import ExitStack
+
+        out = self.root/'batch'
+        out.mkdir()
+        (out/'manifest.json').write_bytes(self.raw)
+        cfg = self.root/'config.json'
+        write_json(cfg, dict(run_dir=str(self.root), results=str(self.root/'results.json'), device='cuda'))
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(gpu, 'bundle_files', return_value=(self.manifest, self.raw, {})))
+            stack.enter_context(patch.object(gpu, 'accepted_rows'))
+            probe = stack.enter_context(patch.object(gpu, 'gh', side_effect=FileNotFoundError('gh')))
+            request = stack.enter_context(patch.object(gpu, 'request', return_value={'status':'needs_workstation'}))
+            submit = stack.enter_context(patch.object(gpu, 'submit'))
+            finish = stack.enter_context(patch.object(gpu, 'finish_direct', return_value={'run_id':17}))
+            self.assertEqual(gpu.run_gpu(cfg, out)['status'], 'needs_workstation')
+            submit.assert_not_called()
+            probe.side_effect = None
+            def ambiguous(bundle, direct, branch):
+                direct.mkdir()
+                write_json(direct/'submission.json', dict(phase='dispatch_requested', branch=branch))
+                raise RuntimeError('connection reset')
+            submit.side_effect = ambiguous
+            self.assertEqual(gpu.run_gpu(cfg, out)['run_id'], 17)
+            finish.assert_called_once()
+            self.assertEqual(request.call_count, 1)
+
     def test_server_request_is_idempotent_and_preserves_npu_result(self):
         run = self.root / 'run'
         output = run / 'reports/wsl-request'

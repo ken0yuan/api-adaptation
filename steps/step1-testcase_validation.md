@@ -4,7 +4,7 @@
 
 有效的 NPU `fail` 或 `blocked` 也继续 GPU 参考验证，两侧结果分别保存。
 
-Step3 交回的实现回归使用同一快照核验和状态同步命令。读取该 API 的设计和修改后报告，核对原失败断言及设计中的必测项。生成器自检只核对实际生成的用例。直接适配项在 Step3 修复其回归用例；同步状态后，适配项完整通过进入 Step4，其余保持待适配并回 Step3。
+Step3 交回的实现回归使用同一快照核验和状态同步命令。读取该 API 的设计和修改后报告，核对原失败断言及设计中的必测项。用例缺口按本步流程退回 Step0.1；用例有效且测出实现错误时回 Step3，实施回归通过后进入 Step3.1。
 
 ## 接收 NPU 结果
 
@@ -36,7 +36,14 @@ cat <torch_npu源码仓>/test/api_supplement/README.md
 2. 对照 README 与生成器自检记录，核对目标仓要求。
    - 重点检查 API 方法命名。
    - 按 API 是否依赖硬件，核对设备选择和实际执行行为。
+   - 对 GPU/NPU 共用的用例，检查设备分支和 helper。两侧可以用各自的设备、流及初始化方式；对照同一功能时，应保持等价输入和初始状态，核对目标调用次数、同步相对位置及断言使用的返回值或副作用。例如验证 CPU offload 首次返回值，就在两端断言第一次 `scale()` 的结果。若某端需要单独验证另一种保证，分开记录观察值和适用设备。
    - 发现目标仓要求与生成器模板冲突时，将具体差异交回生成器修复本次用例。
+3. **这个 API 要测哪些用法？** 先读目标版本 PyTorch 源码里这个 API 自己的声明和 docstring。算子有 YAML 定义时，看对应重载的参数、默认值和返回值；Python 接口看函数或方法的签名。结合 docstring 里的参数说明和示例，列出哪些用法会改变结果或状态，再对照 Step0.1 的用例逐项检查。某个行为在声明和说明里没写清时，再查对应实现。
+   - 对每项功能，写明 NPU 已有的实现入口。还缺的，列出可行的适配办法和验收用例，交 Step2 设计。涉及 CUDA 时先看它实际完成了什么，再找 NPU 上的对应做法。
+4. **用例真的测到了吗？** 找到调用 API 的那一行，以及检查这次调用结果的断言，再从本轮 JUnit 或日志确认这个方法确实跑过。例如，用例要验证“等待另一个进程”，如果去掉等待，断言仍然会通过，就要退回 Step0.1 补用例。
+5. **为什么能跳过？** 写明是哪条 skill 规定或目标版本的哪段 PyTorch 原文排除了这种用法，并解释它为什么适用于当前场景。说已有用例测过，就指出测试方法和断言。拿不出依据，或发现整项漏测，就写清要补哪次调用、检查什么结果，退回 Step0.1。有效用例因缺依赖没跑起来，补环境再测；有效用例跑出了 NPU 实现错误，首次交 Step2，已有方案的交 Step3。
+
+按[功能审核记录](../references/API-Testcase-relationship.md#功能审核记录)保存本次判断并同步状态。需要补用例时，确认该 API 已回到 `next_step=step0.1`。
 
 #### 2. 生成器自检记录
 
@@ -106,81 +113,13 @@ cat <torch_npu源码仓>/test/api_supplement/README.md
    - Step1 收到新材料后重新验收，再上传 GPU。
    - 符合 API 契约的 NPU `fail` 或实际环境 `blocked`，按真实结果继续 GPU 参考验证。
 
-## 第二轮：GPU 服务器验证
+## GPU 请求和结果
 
-### 1. 准备导出内容
-
-按[GPU 验证的上传、恢复与结果交接约定](../references/wsl-gpu-tests.md)准备本次验证。
-
-1. 选择 API 和文件。
-   - 默认取所选 API 的 NPU 快照文件并集。
-   - 指定 `extra_paths` 时，导出内容必须与该并集一致。
-   - 只验证受影响的 API 时，在配置的 `apis` 中列出对应的 `results[].api`。
-2. 准备导出包。
-   - 包含测试、辅助文件、所需数据、可迁移依赖版本及文件 SHA256 清单。
-   - torch_npu 实现、CANN 和整个虚拟环境留在源服务器。
-   - 已确认无设备依赖的 API 从 `device_independent_apis` 写入 manifest，执行端和结果解析均按此核验。未标记的 API 默认需要 CUDA 执行证据。
-
-```text
-python <脚本目录>/step1_remote.py prepare --config <导出配置> --output <唯一导出目录>
-```
-
-3. 准备 GPU 环境参数。
-   - Python 匹配本次解释器主次版本，当前支持 3.10～3.13。
-   - GitHub GPU 工作流使用 `cu132` 或 `cu134`。固定版本直接沿用 AI_LOOP Step 0 在本次运行目录 `requirements.txt` 中写好的 torch 约束，随可迁移依赖交给 GPU 工作流；nightly 沿用未固定 torch 的清单。记录 NPU、GPU 的实测构建。
-
-### 2. 上传 GitHub 并触发验证
-
-本机可访问 GitHub，且具备已登录的 `gh` 及目标仓 Contents、Actions 权限时，提交导出包并触发 GPU 服务器验证。
-
-```text
-python <脚本目录>/step1_wsl_gpu.py submit --bundle <唯一导出目录>/bundle.zip --output <唯一GPU运行目录> --branch <唯一验证分支>
-```
-
-1. 入口创建唯一分支和单个测试提交，保存 Run ID、提交 SHA 和派发记录。
-2. 核对工作流选中了全部目标文件，在 unittest 收集时记录源码哈希和设备选择，保持原始用例内容。
-3. 本机无法访问 GitHub 时，按下一节请求调用方协助。
-
-### 3. 本机无法访问 GitHub 时
-
-生成验证请求，将请求文件的绝对路径交给调用方。
-
-```text
-python <脚本目录>/step1_wsl_gpu.py request --config <导出配置> --output <唯一导出目录>
-```
-
-1. 请调用方准备可访问 GitHub 的执行环境。
-   - 提供 Python、原生 SSH、已登录的 `gh` 及目标仓 Contents、Actions 权限。
-   - 按请求取得本批导出包，上传 GitHub，触发 GPU 服务器验证。
-   - 保留请求、运行编号和输出目录，完成后交回原始结果与报告。
-2. 请求文件 `step1-request.json` 包含本批 API、文件身份和恢复位置。
-   - 初始状态为 `needs_workstation`，运行中为 `running`。
-   - 报告导入后为 `result_received`，测试结论从报告读取。
-3. 调用方可按约定使用以下入口完成上传、触发和结果交回。
-
-```text
-python <调用方脚本目录>/step1_wsl_bridge.py assist --source-ssh <源服务器SSH别名> --request <step1-request.json绝对路径> --local-output <唯一输出目录> --watch
-```
+用例验收通过后进入 [Step 1.1 发送 GPU 请求](step1.1-gpu_handoff.md)。后续步骤改过用例或辅助文件时，重新验收受影响项后再走同一入口。
 
 ### 4. 等待与恢复
 
-1. 等待期间留在 Step1，保留已有证据。
-   - 记录 `device_validation.cuda.execution=not_run`。
-   - 等待调用方协助时，记录 `reason=awaiting_workstation_gpu`。
-2. 使用 `--watch` 在后台持续查询原 GPU 任务，将进程号和输出日志保存在本次工作记录中。
-   - 脚本每 10 秒查询一次，持续更新 GPU 运行目录下的 `run.json`。
-   - 任务完成后，脚本下载结果并生成报告。调用方协助的任务由 `assist --watch` 完成结果交回。
-   - 直接提交的任务，使用以下命令等待结果。
-
-```text
-python <脚本目录>/step1_wsl_gpu.py fetch --output <唯一GPU运行目录> --watch
-```
-
-3. AI 每 4 分钟查看一次后台进程、`run.json` 和输出日志。
-   - 进程正常且 GPU 任务仍在运行时，继续等待原任务。
-   - 脚本结束后检查报告，进入“验收并导入报告”。
-   - 脚本异常退出时，检查日志并处理原因，沿用原运行目录或同一请求重新启动 `fetch --watch` 或 `assist --watch`。
-4. 触发响应丢失时，按唯一分支和 SHA 恢复运行编号。无法唯一匹配时记录阻塞原因，先核对远端运行记录。
+Step 1.1 的 `run` 命令负责直连后的等待、下载和导入。进程中断时沿用原目录重跑；在运行期间可以查看 `direct/submission.json` 和 `direct/run.json`。工作站求助已登记时，保留票据和 `awaiting_workstation_gpu` 状态，等待转发器回传。实验结果未返回前，PR 的 GPU 栏写明待验证的范围。
 
 ### 5. 验收并导入报告
 
@@ -232,9 +171,9 @@ python3 <api-adaptation安装目录>/scripts/record_api_status.py \
 
 1. 同批还有 API 等待 GPU 时，通常在收到结果或记录实际阻塞原因后同步。
 2. 子 agent 执行脚本后回读两个文件，逐 API 核对写回值：
-   - 在 `api-loop/result.json` 中回读同一条目。确认回退时，`status` 应为 `待适配`；首次发现实现缺口时 `next_step` 应为 `step2`，已有 `adaptation` 的实施复测仍回退时应为 `step3`。已按本步要求验证通过的项应为 `status=支持`、`next_step=step4`。
+   - 在 `api-loop/result.json` 中回读同一条目。确认回退时，`status` 应为 `待适配`；首次发现实现缺口时 `next_step` 应为 `step2`，已有 `adaptation` 的实施复测仍回退时应为 `step3`。只补测试的项通过后为 `支持 / step4`。改过实现的项通过后为 `待适配 / step3.1`，复核通过后才记为 `支持 / step4`。
    - 在本批 `adapt-information.json` 中，核对 `api-status["<数据库正名>"]` 与上述条目的 `status` 一致。正名按策略表解析，结果条目有 `database_api` 时使用该值核对。
-   - `next_step=step0.1` 的待生成或待修复项保持该去向，并将本批状态更新为 `补充testcase`，避免旧的支持状态覆盖修复任务。
+   - `next_step=step0.1` 的待生成或待修复项保持该去向；原策略为 `待适配` 的项保留该状态和方案，其余补测项记为 `补充testcase`。
    - `pass`、`fail` 必须有实际执行报告，报告路径相对结果目录。
    - `strategy` 保留最初数据库策略。
    - PR 确认合入后，由调用方回填数据库支持结论。
@@ -244,8 +183,9 @@ python3 <api-adaptation安装目录>/scripts/record_api_status.py \
 
 | 有效 NPU 结论 | 本批状态 | 后续 |
 |---|---|---|
-| 通过 | `支持` | Step4 汇总，向调用方交付 GPU 结果或阻塞原因 |
+| 通过 | 只补测试记为 `支持`；实施回归保持 `待适配` 直至复核通过 | 只补测试交 Step4；实施回归先交 Step3.1 |
 | 失败 | `待适配` | 首次发现的实现缺口交 Step2；已有适配实现的复测失败回 Step3 |
+| 用例已验收，工作站票据缺失或对应旧文件 | 保留当前补测或适配状态 | 进入 Step 1.1 登记当前版本的请求，再同步状态 |
 | 未运行、跳过、阻塞或部分完成 | 保留原状态，新补测项保持 `补充testcase` | 留在 Step1，保留尚缺材料和原因 |
 
 ## 其他入口与测试范围

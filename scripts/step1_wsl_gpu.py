@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Submit an exported Step1 bundle from a GitHub-enabled workstation; return GPU evidence."""
 import argparse
+from contextlib import closing
 import datetime
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -15,7 +17,7 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 
-from adaptation_target import gpu_target, matches_build
+from adaptation_target import equivalent_requirements, gpu_target, matches_build
 from step1_remote import export_inputs, prepare, write_json
 
 REPO = 'the-fall-moon/git_test_demo'
@@ -24,6 +26,71 @@ WORKFLOW = 'wsl-gpu-tests.yml'
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def ai_loop_root(path):
+    # Walk the components of this exact path, without listing directories.
+    for parent in path.parents:
+        if parent.parts[-3:] == ('AI_LOOP', 'data', 'run_data'):
+            return parent.parent.parent
+    return None
+
+
+def publish_request(path, ticket):
+    if path.exists():
+        existing = json.loads(path.read_bytes())
+        if existing['manifest_sha256'] != ticket['manifest_sha256']:
+            raise ValueError('Existing request belongs to another export')
+        return existing
+    write_json(path, ticket)
+    return ticket
+
+
+def register_path(root, path, sha, ticket=None):
+    relative = path.relative_to(root).as_posix()
+    with closing(sqlite3.connect(root / 'data/gpu-requests.sqlite3', timeout=20)) as db, db:
+        db.execute('CREATE TABLE IF NOT EXISTS requests '
+                   '(request_path TEXT PRIMARY KEY, manifest_sha256 TEXT NOT NULL)')
+        db.execute('INSERT INTO requests VALUES (?, ?) ON CONFLICT(request_path) DO NOTHING', (relative, sha))
+        if path.exists() and json.loads(path.read_bytes()).get('manifest_sha256') != sha:
+            raise ValueError('Existing request belongs to another export')
+        stored, = db.execute('SELECT manifest_sha256 FROM requests WHERE request_path=?', (relative,)).fetchone()
+        if stored != sha:
+            raise ValueError('Registered path already belongs to a different manifest: ' + relative)
+        if ticket is not None:
+            # Persist discoverability first; a crash can never hide a published file.
+            db.commit()
+            db.execute('BEGIN IMMEDIATE')
+            return publish_request(path, ticket)
+
+
+def register_existing(path):
+    path = Path(path).resolve(strict=True)
+    root = ai_loop_root(path)
+    if root is None or path.name != 'step1-request.json':
+        raise ValueError('Expected the exact request file inside AI_LOOP/data/run_data')
+    ticket = json.loads(path.read_bytes())
+    sha = digest((path.parent / 'manifest.json').read_bytes())
+    if (ticket.get('type') != 'step1_wsl_gpu' or ticket.get('schema_version') != 1
+            or ticket.get('manifest_sha256') != sha):
+        raise ValueError('Invalid GPU request or manifest digest')
+    register_path(root, path, sha)
+    return ticket
+
+
+def accepted_rows(config, manifest):
+    current = json.loads(Path(config['results']).read_bytes())
+    export_inputs(config, current, manifest)
+    rows = {row['api']: row for row in current['results']}
+    run = Path(config['run_dir']).resolve()
+    if manifest.get('npu_snapshots') and ai_loop_root(run):
+        from record_api_status import coverage_problem
+        for item in manifest['results']:
+            row = rows[item['api']]
+            issue = coverage_problem(row, run)
+            if issue or row.get('next_step') == 'step0.1':
+                raise ValueError(f"{row['api']} 尚未通过 Step 1 验收：{issue or '用例正在返工'}")
+    return current, rows
 
 
 def request(config_path, output):
@@ -41,11 +108,6 @@ def request(config_path, output):
     current = json.loads(Path(config['results']).read_text(encoding='utf-8'))
     export_inputs(config, current, manifest)
     path = output / 'step1-request.json'
-    if path.exists():
-        ticket = json.loads(path.read_text(encoding='utf-8'))
-        if ticket['manifest_sha256'] != digest(raw):
-            raise ValueError('Existing request belongs to another export')
-        return ticket
     ticket = {'schema_version': 1, 'type': 'step1_wsl_gpu', 'status': 'needs_workstation',
               'request_path': str(path), 'manifest_sha256': digest(raw),
               'request_id': output.name + '-' + digest(raw)[:12], 'branch': 'check/' + output.name,
@@ -53,16 +115,33 @@ def request(config_path, output):
                          'config': str(config_path), 'output': str(output)},
               'apis': [e['api'] for e in manifest['results']],
               'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
-    write_json(path, ticket)
-    return ticket
+    root = ai_loop_root(path)
+    if root is not None:
+        if manifest.get('npu_snapshots'):
+            from npu_handoff import record_lock
+            results = Path(config['results']).resolve()
+            run = Path(config['run_dir']).resolve()
+            results.relative_to(run)
+            with record_lock(results):
+                current, rows = accepted_rows(config, manifest)
+                registered = register_path(root, path, digest(raw), ticket)
+                for api in ticket['apis']:
+                    cuda = rows[api]['device_validation'].setdefault('cuda', {})
+                    if cuda.get('execution', 'not_run') == 'not_run':
+                        cuda.update(execution='not_run', request=path.relative_to(run).as_posix(),
+                                    reason='awaiting_workstation_gpu')
+                write_json(results, current)
+                return registered
+        return register_path(root, path, digest(raw), ticket)
+    return publish_request(path, ticket)
 
 
-def gh(*args, payload=None):
+def gh(*args, payload=None, timeout=120):
     command = ['gh', *args]
     if payload is not None:
         command += ['--input', '-']
     proc = subprocess.run(command, input=json.dumps(payload) if payload is not None else None,
-                          capture_output=True, text=True, encoding='utf-8')
+                          capture_output=True, text=True, encoding='utf-8', timeout=timeout)
     if proc.returncode:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
     return proc.stdout
@@ -292,10 +371,16 @@ def analyze(manifest_bytes, state, run, artifact):
 def fetch(output, wait_seconds):
     state = json.loads((output / 'submission.json').read_text(encoding='utf-8'))
     if not state.get('run_id'):
-        runs = api('actions/workflows/' + WORKFLOW + '/runs?event=workflow_dispatch&branch=' + state['branch'])['workflow_runs']
-        matches = [r for r in runs if r['head_sha'] == state['head_sha'] and r['created_at'] >= state['requested_at'][:19] + 'Z']
-        if len(matches) != 1:
-            raise RuntimeError('Cannot uniquely recover Run ID; do not dispatch again')
+        # A dispatch response can be lost before GitHub indexes the new run.
+        until = time.monotonic() + (60 if wait_seconds is None else 0)
+        while True:
+            runs = api('actions/workflows/' + WORKFLOW + '/runs?event=workflow_dispatch&branch=' + state['branch'])['workflow_runs']
+            matches = [r for r in runs if r['head_sha'] == state['head_sha'] and r['created_at'] >= state['requested_at'][:19] + 'Z']
+            if len(matches) == 1:
+                break
+            if matches or time.monotonic() >= until:
+                raise RuntimeError('Cannot uniquely recover Run ID; do not dispatch again')
+            time.sleep(10)
         state['run_id'] = matches[0]['id']
         write_json(output / 'submission.json', state)
     deadline = None if wait_seconds is None else time.monotonic() + wait_seconds
@@ -315,7 +400,7 @@ def fetch(output, wait_seconds):
         download = Path(tempfile.mkdtemp(prefix='download-', dir=evidence))
         try:
             gh('run', 'download', str(run['id']), '-R', REPO, '-n',
-               'gpu-results-%s-%s' % (run['id'], run['run_attempt']), '-D', str(download))
+               'gpu-results-%s-%s' % (run['id'], run['run_attempt']), '-D', str(download), timeout=600)
             download.rename(artifact)
         except RuntimeError as error:
             (evidence / 'download-error.log').write_text(str(error), encoding='utf-8')
@@ -354,39 +439,155 @@ def _merge(config, output, path):
             raise ValueError('Missing original unittest receipt or source proof')
     relative_report = report_path.resolve().relative_to(run_dir).as_posix()
     result = json.loads(path.read_text(encoding='utf-8'))
-    export_inputs(config, result, manifest, legacy_subset=True)
+    if 'npu_snapshots' not in manifest:
+        export_inputs(config, result, manifest, legacy_subset=True)
+    elif 'torch_index' in config:
+        index, requirement = gpu_target(config)
+        if index != manifest['torch_index'] or not equivalent_requirements(requirement, manifest['torch_requirement']):
+            raise ValueError('Saved GPU export belongs to a different PyTorch target')
     by_api = {e['api']: e for e in result['results']}
     expected = {e['api']: e['test_files'] for e in manifest['results']}
     if [e['api'] for e in report['results']] != list(expected):
         raise ValueError('Returned API scope mismatch')
+    imported = []
     for item in report['results']:
-        entry = by_api[item['api']]
+        api = item['api']
+        if 'npu_snapshots' in manifest:
+            from npu_handoff import evidence_path, verify_evidence
+            ref = manifest['npu_snapshots'][api]
+            raw_snapshot = evidence_path(run_dir, ref['path']).read_bytes()
+            if digest(raw_snapshot) != ref['sha256']:
+                raise ValueError('Exported NPU snapshot changed: ' + api)
+            original = json.loads(raw_snapshot)
+            if original['api'] != api or original['test_files'] != expected[api] or any(
+                    manifest['files'].get(name) != sha for name, sha in original['files'].items()):
+                raise ValueError('Export does not match the NPU scope: ' + api)
+            current = by_api.get(api, {}).get('device_validation', {}).get('npu', {})
+            if current.get('handoff_files') != original['files'] or by_api[api]['test_files'] != expected[api]:
+                continue
+            verify_evidence(by_api[api], run_dir)
+        entry = by_api[api]
         if entry['test_files'] != expected[item['api']]:
             raise ValueError('Current task file scope changed')
         if [f['file'] for f in item['files']] != expected[item['api']] or any(f['sha256'] != manifest['files'][f['file']] for f in item['files']):
             raise ValueError('Returned file scope/hash mismatch')
+        imported.append({'api': api, 'execution': item['execution']})
         metadata = {k: report.get(k) for k in ['environment', 'run_id', 'run_attempt', 'url', 'branch', 'head_sha', 'reason']}
         entry.setdefault('device_validation', {})['cuda'] = dict(item, report=relative_report, **metadata)
+    if not imported:
+        return {'status': 'GPU_RESULTS_SUPERSEDED', 'report': relative_report, 'results': []}
     backup = output / 'result.before-wsl-merge.json'
     if not backup.exists():
         shutil.copy2(path, backup)
     write_json(path, result)
     return {'status': 'GPU_RESULTS_IMPORTED', 'report': relative_report,
-            'results': [{'api': e['api'], 'execution': e['execution']} for e in report['results']]}
+            'results': imported}
+
+
+def transient_github_error(error):
+    message = str(error).lower()
+    return isinstance(error, subprocess.TimeoutExpired) or any(word in message for word in (
+        'timeout', 'timed out', 'connection reset', 'connection refused', 'unable to connect',
+        'error connecting', 'could not resolve', 'temporary failure', 'network is unreachable',
+        'unexpected eof', 'tls handshake', 'http 429', 'http 500', 'http 502', 'http 503', 'http 504'))
+
+
+def finish_direct(config, direct):
+    while True:
+        try:
+            report = fetch(direct, None)
+            artifact = direct / 'evidence' / ('artifacts-' + str(report['run_attempt']))
+            error_log = direct / 'evidence/download-error.log'
+            if not artifact.exists() and error_log.is_file():
+                error = RuntimeError(error_log.read_text(encoding='utf-8'))
+                if transient_github_error(error):
+                    raise error
+            result = merge(config, direct)
+            return dict(result, run_id=report['run_id'], execution=report['execution'])
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            if not transient_github_error(error):
+                raise
+            print('GitHub 暂不可达，10 秒后继续查询同一运行。', file=sys.stderr, flush=True)
+            time.sleep(10)
+
+
+def run_gpu(config_path, output):
+    """Choose one route per export and wait for a direct dispatch in this process."""
+    from npu_handoff import record_lock
+    config_path = Path(config_path).resolve()
+    config = json.loads(config_path.read_bytes())
+    run = Path(config['run_dir']).resolve()
+    output = Path(output).resolve()
+    output.relative_to(run)
+    Path(config['results']).resolve().relative_to(run)
+    if output == run or config.get('device') != 'cuda':
+        raise ValueError('Expected a CUDA export directory inside this batch')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # The lock is per export, separate from the short result.json write lock.
+    with record_lock(output.parent / (output.name + '.route')):
+        if not output.exists():
+            prepare(config, output)
+        direct = output / 'direct'
+        state_path = direct / 'submission.json'
+        ticket = output / 'step1-request.json'
+        if ticket.exists():
+            return request(config_path, output)
+        if state_path.exists():
+            state = json.loads(state_path.read_bytes())
+            if (direct / 'manifest.json').read_bytes() != (output / 'manifest.json').read_bytes():
+                raise ValueError('Direct submission belongs to a different export')
+            if state.get('run_id') or state['phase'] == 'dispatch_requested':
+                return finish_direct(config, direct)
+            # submit() durably records dispatch_requested before sending its POST.
+            if state['phase'] not in ('preparing', 'committed'):
+                raise ValueError('Unknown direct submission phase')
+            return request(config_path, output)
+        manifest, raw, _ = bundle_files(output / 'bundle.zip')
+        if (output / 'manifest.json').read_bytes() != raw:
+            raise ValueError('Bundle and export manifest differ')
+        accepted_rows(config, manifest)
+        try:
+            gh('api', '--hostname', 'github.com', f'repos/{REPO}/actions/workflows/{WORKFLOW}',
+               '--jq', '.id', timeout=15)
+        except (FileNotFoundError, RuntimeError, subprocess.TimeoutExpired) as error:
+            print(f'GitHub 工作流探测失败，登记工作站请求：{error}', file=sys.stderr, flush=True)
+            return request(config_path, output)
+        try:
+            submit(output / 'bundle.zip', direct, 'check/direct-' + output.name)
+        except (RuntimeError, FileNotFoundError, subprocess.TimeoutExpired) as error:
+            state = json.loads(state_path.read_bytes()) if state_path.exists() else {}
+            if state.get('phase') != 'dispatch_requested' or re.search(r'HTTP (401|403|404)\b', str(error)):
+                print(f'GitHub 未接受直接派发，登记工作站请求：{error}', file=sys.stderr, flush=True)
+                return request(config_path, output)
+            # The dispatch may have succeeded despite a lost response. Recover it by SHA.
+        return finish_direct(config, direct)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['request', 'submit', 'fetch', 'import'])
-    parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('action', choices=['run', 'request', 'register', 'submit', 'fetch', 'import'])
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--request-path', type=Path, help='Exact existing request to register for AI_LOOP')
     parser.add_argument('--bundle', type=Path)
     parser.add_argument('--branch')
     parser.add_argument('--config', type=Path)
     parser.add_argument('--wait-seconds', type=int, default=0)
     parser.add_argument('--watch', action='store_true', help='Poll the existing run until it completes')
     args = parser.parse_args()
+    if args.action == 'register':
+        if not args.request_path:
+            parser.error('register requires --request-path')
+        register_existing(args.request_path)
+        print(args.request_path.resolve())
+        return 0
+    if not args.output:
+        parser.error('this action requires --output')
     output = args.output.resolve()
-    if args.action == 'request':
+    if args.action == 'run':
+        if not args.config:
+            parser.error('run requires source --config')
+        result = run_gpu(args.config, output)
+    elif args.action == 'request':
         if not args.config:
             parser.error('request requires source --config')
         result = request(args.config, output)

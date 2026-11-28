@@ -16,7 +16,7 @@ from dispatch_adaptation_tasks import dispatch
 from npu_handoff import verify_evidence
 from prepare_adapt_information import prepare
 from prepare_development_branch import prepare as prepare_branch
-from publish_pr import check_gpu_evidence, owned_status
+from publish_pr import check_gpu_evidence, delivery_status
 from reconcile_prs import finish_merged
 
 
@@ -73,12 +73,13 @@ class WithdrawTests(unittest.TestCase):
             attempt = self.loop/'npu-attempts'/suffix
             files = {test:w.file_hash(path),self.helper:w.file_hash(helper)}
             self.put(attempt/'snapshot.json',dict(api=api, started_ns=1, files=files, test_files=[test], extra_paths=[self.helper]))
+            self.put(attempt/'snapshot.coverage.json',dict(api=api, snapshot_sha256=w.file_hash(attempt/'snapshot.json')))
             (attempt/'report.md').write_text('result');(attempt/'test.log').write_text('log')
             evidence = {k:str((attempt/f).relative_to(self.run)) for k,f in
                         [('snapshot','snapshot.json'),('report','report.md'),('log','test.log')]}
             npu = dict(**evidence, execution='pass', started_ns=1, handoff_files=files,
                        artifacts={v:w.file_hash(self.run/v) for v in evidence.values()})
-            self.rows.append(dict(api=api,database_api=api,status='支持',report=evidence['report'],
+            self.rows.append(dict(api=api,database_api=api,status='支持',next_step='step4',report=evidence['report'],
                                   execution='pass',test_files=[test],device_validation={'npu':npu}))
             self.put(self.loop/'handoffs'/(suffix+'.json'),{'api':api})
         gpu = self.loop/'reports/gpu'
@@ -109,6 +110,18 @@ class WithdrawTests(unittest.TestCase):
         self.assertEqual(w.file_hash(self.db),self.db_hash)
         self.assertEqual(w.file_hash(self.classification),self.class_hash)
 
+    def test_active_design_cannot_be_withdrawn_with_only_a_baseline_failure(self):
+        row = self.rows[0]
+        row.update(next_step='step2', execution='fail', status='待适配')
+        self.put(self.result, {'results': self.rows})
+        with self.assertRaisesRegex(ValueError, '仍待 Step 2'):
+            w.withdraw(self.run, row['api'])
+        self.assertTrue((self.repo / row['test_files'][0]).is_file())
+        report = self.run / 'final-assessment.md'
+        report.write_text(row['api'] + '：本轮最终验证及依赖依据', encoding='utf8')
+        preview = w.withdraw(self.run, row['api'], dry=True, final_report=report.name)
+        self.assertEqual(preview['status'], 'WITHDRAWAL_PREVIEW')
+
     def test_mixed_batch_and_real_resumption(self):
         old_report=self.report.read_bytes()
         ticket=self.manifest.with_name('step1-request.json')
@@ -123,6 +136,8 @@ class WithdrawTests(unittest.TestCase):
         self.assertTrue((self.loop/'handoffs/b.json').is_file())
         self.assertFalse((self.repo/self.rows[0]['test_files'][0]).exists())
         self.assertFalse((self.run/self.rows[0]['report']).exists())
+        self.assertFalse((self.run/self.rows[0]['report']).with_name('snapshot.coverage.json').exists())
+        self.assertTrue((self.run/self.rows[1]['report']).with_name('snapshot.coverage.json').exists())
         self.assertTrue((self.repo/self.helper).is_file())
         retained=w.read_object(self.result)['results']
         self.assertEqual(retained,[self.rows[1]])
@@ -133,7 +148,7 @@ class WithdrawTests(unittest.TestCase):
         a=w.read_object(self.adapt)
         self.assertEqual(a['task-branches'],['adapt-torch.b'])
         self.assertEqual(a['adapt-plan']['step1']['task-branches'],['adapt-torch.b'])
-        self.assertEqual(owned_status(a),{'torch.b':'支持'})
+        self.assertEqual(delivery_status(self.run, a),{'torch.b':'支持'})
         self.assertEqual(w.read_object(self.mapping),{'nightly':{'adapt-torch.b':self.branch},'2.15':{'adapt-torch.a':'another-branch'}})
         check_gpu_evidence(self.run,self.repo,w.git(self.repo,'rev-parse','HEAD'),self.result,
                            [r['test_files'][0] for r in self.rows],'')

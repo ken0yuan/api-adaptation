@@ -31,6 +31,12 @@ def available(row):
         raise ValueError(f'{row["API名称"]}: API已从wheel下线，不能生成适配用例')
 
 
+def full_entry(name):
+    if name == 'Tensor' or name.startswith('Tensor.'):
+        return 'torch.' + name
+    return name
+
+
 def representative(conn, api, table):
     row = None
     for name in equivalent_names(api):
@@ -49,7 +55,8 @@ def representative(conn, api, table):
     return row
 
 
-def prepare(database, api, task=None, *, category=None, generation_only=True, table=None, strategy_only=False):
+def prepare(database, api, task=None, *, category=None, generation_only=True, table=None, strategy_only=False,
+            repair_entry=None):
     table = strategy_table(table)
     if category is not None and category not in GENERATOR_CATEGORIES:
         raise ValueError('生成器类别须为计算类、框架类、分布式类或图模式类')
@@ -61,14 +68,15 @@ def prepare(database, api, task=None, *, category=None, generation_only=True, ta
         if strategy_only:
             return {'api':api, 'database_api':row['API名称'], 'strategy':row['适配策略'],
                     'api_adaptation_type':row['API适配分类'], 'classification_source':origin}
-        if row['适配策略'] != '补充testcase':
+        design_repair = (repair_entry and repair_entry.get('api') == api and repair_entry.get('adaptation')
+                         and repair_entry.get('next_step') == 'step0.1'
+                         and repair_entry.get('strategy') == row['适配策略'] == '待适配')
+        if row['适配策略'] != '补充testcase' and not design_repair:
             raise ValueError(f'{api}: 当前适配策略不是补充testcase，返回Step0重新分流')
         adaptation_type = row['API适配分类']
         if not adaptation_type and category is None:
             raise ValueError(f'{api}: API适配分类缺失，交回调用方补齐')
-        full_name = row['API名称']
-        if full_name == 'Tensor' or full_name.startswith('Tensor.'):
-            full_name = 'torch.' + full_name
+        full_name = full_entry(api)
         generator_category = category if category is not None else CATEGORIES.get(adaptation_type)
         if generator_category is None:
             raise ValueError(f'{api}: {adaptation_type}尚无对应的生成器初分类别')
@@ -93,6 +101,7 @@ def main():
     parser.add_argument('--table', help='API strategy table supplied by the caller')
     parser.add_argument('--run-dir', type=Path, help='AI_LOOP run directory containing basic_information.json')
     parser.add_argument('--strategy-only', action='store_true', help='Read the strategy before choosing a step')
+    parser.add_argument('--repair-results', type=Path, help='Step1 退回直接适配项补用例的 result.json')
     parser.add_argument('--api', required=True)
     parser.add_argument('--task')
     parser.add_argument('--category', choices=GENERATOR_CATEGORIES)
@@ -103,8 +112,13 @@ def main():
         if args.run_dir and target is None:
             raise ValueError('Missing basic_information.json in ' + str(args.run_dir))
         table = strategy_table(args.table, target[0] if target else None)
+        repair_entry = None
+        if args.repair_results:
+            from npu_handoff import entry_for, load
+            repair_entry = entry_for(load(args.repair_results), args.api)
         result = prepare(args.database, args.api, args.task, category=args.category,
-                         generation_only=not args.execute_npu, table=table, strategy_only=args.strategy_only)
+                         generation_only=not args.execute_npu, table=table, strategy_only=args.strategy_only,
+                         repair_entry=repair_entry)
     except (ValueError, sqlite3.Error, KeyError, OSError) as error:
         print('GENERATION_INPUT_FAILED: ' + str(error), file=sys.stderr)
         return 1

@@ -7,9 +7,10 @@ from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from npu_handoff import load, record, snapshot, start_design
+from npu_handoff import load, record, repair, snapshot, start_design
 from record_api_status import record_status
 from step1_remote import export_inputs, write_json
+from test_record_api_status import write_coverage
 
 
 class AdaptationWorkflowTests(unittest.TestCase):
@@ -44,10 +45,10 @@ class AdaptationWorkflowTests(unittest.TestCase):
         row = dict(api=self.api, strategy=strategy, execution='not_run',
                    generation='not_generated', test_files=[])
         if strategy == '补充testcase':
-            (self.run / 'failed.log').write_text('pre-fix assertion failure')
-            row.update(execution='fail', generation='generated', report='failed.log',
-                       test_files=['test_api.py'])
+            row.update(generation='generated', test_files=['test_api.py'])
         write_json(self.results, {'results': [row]})
+        if strategy == '补充testcase':
+            record(self.attempt('baseline', 'fail', bind_design=False), self.run)
         before = self.route()
         self.assertEqual(before['next_step'], 'step2')
         baseline = start_design(self.design, self.run)
@@ -55,13 +56,14 @@ class AdaptationWorkflowTests(unittest.TestCase):
         self.assertEqual(start_design(self.design, self.run), baseline)
         self.assertEqual(self.route()['next_step'], 'step3')
 
-    def attempt(self, folder, outcome):
+    def attempt(self, folder, outcome, bind_design=True):
         dest = self.run / folder
         path = dest / 'snap.json'
-        snapshot(SimpleNamespace(results=self.results, source=self.source, api=self.api,
+        snapshot(SimpleNamespace(results=self.results if bind_design else None, source=self.source, api=self.api,
                                  test_file=['test_api.py'], extra_path=[], output=path))
         (dest / 'report.md').write_text('offline report fixture')
         (dest / 'test.log').write_text('offline log fixture')
+        write_coverage(path, self.api, 'test_api.py')
         return SimpleNamespace(results=self.results, source=self.source, snapshot=str(path),
                                execution=outcome, report=str(dest / 'report.md'), log=str(dest / 'test.log'))
 
@@ -72,13 +74,73 @@ class AdaptationWorkflowTests(unittest.TestCase):
             record(args, self.run)
             record(args, self.run)
             row = self.route()
-            self.assertEqual(row['next_step'], 'step4' if state == 'pass' else 'step3')
-            self.assertEqual(row['status'], '支持' if state == 'pass' else '待适配')
+            self.assertEqual(row['next_step'], 'step3.1' if state == 'pass' else 'step3')
+            self.assertEqual(row['status'], '待适配')
         self.assertEqual(row['generation'], 'not_generated')
         entries, _, _, handoff = export_inputs(
             dict(source_root=self.source, run_dir=self.run, apis=[self.api]), load(self.results))
         self.assertTrue(handoff)
         self.assertEqual(entries[0]['api'], self.api)
+
+    def decide(self, action, snap=None):
+        record_status(self.status, self.db, self.results, api=self.api,
+                      decision=(action, 'fixture review evidence', snap))
+        return self.route()
+
+    def test_review_is_bound_to_the_current_snapshot(self):
+        self.prepare('待适配')
+        first = self.attempt('first', 'pass')
+        record(first, self.run)
+        self.assertEqual(self.route()['next_step'], 'step3.1')
+        self.assertEqual(self.decide('rework', first.snapshot)['next_step'], 'step3')
+        second = self.attempt('second', 'pass')
+        record(second, self.run)
+        self.assertEqual(self.route()['next_step'], 'step3.1')
+        with self.assertRaises(ValueError):
+            self.decide('approve', first.snapshot)
+        self.assertEqual(self.decide('approve', second.snapshot)['next_step'], 'step4')
+        self.assertEqual(self.decide('approve', second.snapshot)['status'], '支持')
+        record(self.attempt('third', 'pass'), self.run)
+        self.assertEqual(self.route()['next_step'], 'step3.1')
+
+    def test_global_redesign_survives_sync_and_late_results(self):
+        self.prepare('待适配')
+        old = self.attempt('old', 'pass')
+        self.assertEqual(self.decide('revise')['next_step'], 'step2')
+        with self.assertRaises(ValueError):
+            record(old, self.run)
+        with self.assertRaises(ValueError):
+            start_design(self.design, self.run)
+        self.design.design = 'revised.md'
+        (self.run / self.design.design).write_text('revised design')
+        start_design(self.design, self.run)
+        self.assertEqual(self.route()['next_step'], 'step3')
+
+    def test_adaptation_survives_generated_test_repair(self):
+        self.prepare('补充testcase')
+        record(self.attempt('passed', 'pass'), self.run)
+        self.assertEqual(self.route()['next_step'], 'step3.1')
+        repair(SimpleNamespace(results=self.results, api=self.api, reason='fix assertion'), self.run)
+        self.assertEqual(self.route()['next_step'], 'step0.1')
+        record(self.attempt('repaired', 'pass'), self.run)
+        self.assertEqual(self.route()['next_step'], 'step3.1')
+
+    def test_direct_design_can_return_to_generator_for_missing_behavior(self):
+        from prepare_testcase_handoff import prepare
+        self.prepare('待适配')
+        previous = self.attempt('first', 'pass')
+        record(previous, self.run)
+        repair(SimpleNamespace(results=self.results, api=self.api, reason='缺首次调用的断言'), self.run)
+        row = self.route()
+        self.assertEqual((row['next_step'], row['status']), ('step0.1', '待适配'))
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('ALTER TABLE "API支持数据" ADD COLUMN "API适配分类" TEXT DEFAULT "框架类API"')
+        item = prepare(self.db, self.api, generation_only=False, repair_entry=row)
+        self.assertEqual(item['generator_category'], '框架类')
+        with self.assertRaisesRegex(ValueError, '早于用例返修'):
+            record(previous, self.run)
+        record(self.attempt('fixed', 'pass'), self.run)
+        self.assertEqual(self.route()['next_step'], 'step3.1')
 
     def test_step1_failure_is_reused_with_its_original_evidence(self):
         with closing(sqlite3.connect(self.db)) as conn, conn:
@@ -92,6 +154,7 @@ class AdaptationWorkflowTests(unittest.TestCase):
         report, log = folder / 'report.md', folder / 'test.log'
         report.write_text('test_api.py::test_api failed')
         log.write_text('original assertion')
+        write_coverage(snap, self.api, 'test_api.py')
         record(SimpleNamespace(source=self.source, results=self.results, snapshot=str(snap),
                                report=str(report), log=str(log), execution='fail'), self.run)
         original = self.route()
@@ -120,4 +183,4 @@ class AdaptationWorkflowTests(unittest.TestCase):
         self.assertEqual(self.results.read_bytes(), before)
         record(self.attempt('new', 'pass'), self.run)
         row = self.route()
-        self.assertEqual((row['strategy'], row['status']), ('补充testcase', '支持'))
+        self.assertEqual((row['strategy'], row['status']), ('补充testcase', '待适配'))

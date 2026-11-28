@@ -1,6 +1,6 @@
 # 本批 API 与测试结果
 
-Step2 交接成功后，当前项新增 `adaptation`。其中 `design`、`baseline` 分别指向本次运行目录中的版本化设计文件与原始结果快照，`sha256` 标识设计内容，`attempt` 标识本轮方案。开发中的项为 `待适配 / step3`。Step3 实测快照通过 `adaptation_attempt` 绑定该方案，测试文件、NPU 报告及 GPU 结果沿用现有字段。同步状态时只依据本轮 NPU 结果；尚未通过的适配项继续 Step3。旧结果没有 `adaptation` 时沿用原分流。直接分流的适配回归计入验证结果，保持原 `strategy` 和 `generation`。
+Step2 交接成功后，当前项新增 `adaptation`。其中 `design`、`baseline` 分别指向本次运行目录中的版本化设计文件与原始结果快照，`sha256` 标识设计内容，`attempt` 标识本轮方案。开发中的项为 `待适配 / step3`。Step3 实测快照通过 `adaptation_attempt` 绑定该方案，测试文件、NPU 报告及 GPU 结果沿用现有字段。实施回归通过先进入 `待适配 / step3.1`。复核结论及对应的 NPU 快照记录在 `adaptation.review`，复核通过进入 Step4。退回修订方案的原因记录在 `adaptation.revision_reason`，登记新版方案后恢复 Step3。旧结果没有 `adaptation` 时沿用原分流。直接分流的适配回归计入验证结果，保持原 `strategy` 和 `generation`。
 
 当前不建立全仓 API—用例映射。只在任务结果目录的 `api-loop/result.json` 保存本次 API 的逐项结果，供续跑及调用方汇总。
 
@@ -50,7 +50,7 @@ Step2 交接成功后，当前项新增 `adaptation`。其中 `design`、`baseli
 - `database_api`记录查到的正名行主键，`api_full_name`记录交给生成器的完整入口；不改写原来的`task`和`api`。
 - `classification_source` 保存本次分类的来源。示例中的 `database` 是数据库文件绝对路径，`table` 是固定版本任务实际读取的表，`column` 是分类所在列。回填分类时，按原表和 `database_api` 找到同一行；nightly 的 `table` 为 `API支持数据`。
 - `api_adaptation_type` 沿用本次查得的数据库分类，`generator_category` 是交给生成器的指定类别。分类反馈返回的 `initial_api_adaptation_type` 表示反馈前的分类，`api_adaptation_type` 表示反馈后的分类，`category_reason` 说明分类调整原因，`classification_update` 为 `updated`（已改写分类）或 `unchanged`（原分类适用）。续跑保留已有反馈记录；新任务按 [Step0.1](../steps/step0.1-testcase_development.md) 登记文件和执行结果。
-- `strategy`保留最初查得的数据库策略；`status`是本批进度，同步保存在`adapt-information.json.api-status`，按正名主键记录`补充testcase`、`待适配`或`支持`。生成后`next_step=step1`，失败需适配时为`step2`，通过后为`step4`并交回主agent准备PR。信息缺失时不推进。
+- `strategy`保留最初查得的数据库策略；`status`是本批进度，同步保存在`adapt-information.json.api-status`，按正名主键记录`补充testcase`、`待适配`或`支持`。生成后`next_step=step1`，失败需适配时为`step2`，只补测试通过或实施复核通过后为`step4`并交回主agent准备PR。信息缺失时不推进。
 - 补测项默认 `test_type=functional`，本记录的生成和执行状态对应功能测试。`additional_tests` 分别保存内存、精度、确定性的评估结论与原因，见[四类测试约定](test-types.md)。非补测项不启动四类测试评估，可省略这两个字段。
 - `generation` 取 `not_generated`、`generated`、`failed`。文件存在不等于生成任务已完成。
 - `execution` 取 `not_run`、`pass`、`fail`、`skip`、`blocked`、`partial`；`partial` 表示部分场景通过但仍有未验证场景。
@@ -68,3 +68,15 @@ Step2 交接成功后，当前项新增 `adaptation`。其中 `design`、`baseli
 Step1 交回修复时，旧结果归档到 `api-loop/repairs/`，该项的 `next_step=step0.1`、`notes` 记录具体问题。已有生成状态及历史运行结论不阻止 Step0.1 重新调用生成器。新尝试登记后重新完成 Step1 验收。
 
 状态同步时，待生成或待修复项的 `next_step=step0.1` 优先于任务状态文件中的旧 `api-status`。新尝试登记为 `next_step=step1` 后，按新执行结果更新状态。
+
+## 功能审核记录
+
+把审核结果放在本次 NPU 快照旁。例如，`snapshot.json` 对应 `snapshot.coverage.json`。文件里写 `api`、`snapshot_sha256`（运行 `sha256sum <快照路径>` 取得）和 `features` 数组。每项功能写一条，`feature` 写用法和预期结果，`source` 写所查版本及文件、符号或文档段落。
+
+| 审核结论 | 该条记录怎么填 |
+|---|---|
+| 测到了 | `outcome=tested`。在 `test` 填 `仓内路径::类名.方法名`，在 `assertion` 写调用、断言和本次运行结果，在 `would_fail_if` 写哪种错误会让断言失败。`npu_plan` 写已有实现或需要的改法。有效用例测出实现错误也填这一项，保留实际失败结果。 |
+| 有依据跳过 | `outcome=excluded`。`quote` 摘录原文，`reason` 写原文里的哪个条件适用于这项用法。如果只是本轮任务暂缓，写明后续怎么适配和验收。 |
+| 要补用例 | `outcome=needs_test`。`reason` 写原用例漏了什么、要补哪条断言，`npu_plan` 写要验证的 NPU 实现或可能的改法。 |
+
+运行 Step1 的状态同步命令后，`needs_test` 和缺少出处、引文或理由的 `excluded` 会退回 Step0.1。`pending_coverage` 列出尚缺审核材料的通过或失败记录。补完用例，按新快照重新审核。

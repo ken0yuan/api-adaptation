@@ -139,7 +139,7 @@ def run_material(run, rows, retained, names):
                 delete.add(f)
     # Retries and pre-fix runs can have snapshots that result.json no longer
     # points to. Inspect the recorded API and file scope, not directory names.
-    for snap in (loop / 'npu-attempts').rglob('snapshot.json'):
+    for snap in attempts.union((loop / 'npu-attempts').rglob('snapshot.json')):
         contained(run, snap.relative_to(run))
         old = read_object(snap)
         if old.get('api') not in names or not old.get('test_files') or 'started_ns' not in old:
@@ -151,6 +151,11 @@ def run_material(run, rows, retained, names):
             delete.difference_update(f for f in list(delete) if f.parent == directory)
             continue
         standard = ['run-exit.txt']
+        review = contained(directory, snap.with_suffix('.coverage.json').name)
+        if review.is_file():
+            record = read_object(review)
+            if record.get('api') == old['api'] and record.get('snapshot_sha256') == file_hash(snap):
+                delete.add(review)
         if snap not in attempts:
             standard += ['snapshot.json', 'UT_REPORT.md', 'report.md', 'test.log', 'run.log']
         for name in standard:
@@ -247,7 +252,7 @@ def run_material(run, rows, retained, names):
     return delete, updates, sorted(set(reexport)), sorted(shared)
 
 
-def withdraw(run, api, source=None, dry=False):
+def withdraw(run, api, source=None, dry=False, final_report=None):
     run = run.resolve()
     if run.parent.name != 'run_data' or run.parent.parent.name != 'data':
         raise ValueError('Expected AI_LOOP/data/run_data/<run-id>')
@@ -322,6 +327,12 @@ def withdraw(run, api, source=None, dry=False):
                 rows.append(row)
             else:
                 kept.append(row)
+        if not pending and any(row.get('next_step') == 'step2' for row in rows):
+            if not final_report:
+                raise ValueError('该 API 仍待 Step 2 设计。已有最终撤回结论时，用 --final-report 指明本批依据。')
+            evidence = contained(run, final_report)
+            if not evidence.is_file() or not any(name in evidence.read_text(encoding='utf8') for name in names):
+                raise ValueError('最终报告必须列出本次撤回的 API')
         for row in rows:
             names.update(api_names(row))
         if any(api_names(row) & names for row in kept):
@@ -376,6 +387,8 @@ def withdraw(run, api, source=None, dry=False):
         stamps = {f: f.stat() for f in delete | source_delete}
         # Durable intent precedes destructive changes. Keep the original task list
         # until all other writers finish; the same command can resume an interruption.
+        if final_report:
+            adapt.setdefault('withdrawal-reports', {})[canonical] = str(contained(run, final_report).relative_to(run))
         adapt['withdrawing-api'] = canonical
         write_json(adapt_path, adapt)
         for f, value in updates.items():
@@ -416,10 +429,11 @@ def main():
     parser.add_argument('--run-dir', required=True, type=Path)
     parser.add_argument('--api', required=True)
     parser.add_argument('--source', type=Path, help='Batch branch in an alternate worktree')
+    parser.add_argument('--final-report', help='本批最终失败、验证不足或平台限制的依据（相对运行目录）')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     try:
-        print(json.dumps(withdraw(args.run_dir, args.api, args.source, args.dry_run), ensure_ascii=False, indent=2))
+        print(json.dumps(withdraw(args.run_dir, args.api, args.source, args.dry_run, args.final_report), ensure_ascii=False, indent=2))
     except (KeyError, TypeError, ValueError, OSError, sqlite3.Error, subprocess.CalledProcessError) as error:
         parser.exit(1, f'WITHDRAWAL_FAILED: {error}\n')
 

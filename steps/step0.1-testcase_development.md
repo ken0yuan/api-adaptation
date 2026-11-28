@@ -23,6 +23,8 @@
 
 Step1 交回的 API 直接进入本步修复流程。已有 `generation=generated`、此前的 `execution`、`status` 和 `next_step` 均属于历史进度，不作为拒绝重新调用生成器的条件。保留 API 身份和类别，将 `notes` 中的具体问题与已有测试一起交给生成器。
 
+逐项回应 Step1 点名的功能缺口，用新测试方法和断言说明怎样区分正确与错误实现，重跑后交回 Step1。已有适配方案的项保留原方案；独立调用准备脚本时加 `--repair-results <本次api-loop/result.json>`，批量入口自动读取该记录。
+
 ```bash
 python3 <api-adaptation安装目录>/scripts/prepare_testcase_handoff.py \
   --database <API策略数据库绝对路径> --table "<本次策略表名>" --api <results[].api> \
@@ -35,6 +37,36 @@ python3 <api-adaptation安装目录>/scripts/prepare_testcase_handoff.py \
 - 前序类别缺失时记录缺项，交回调用方补齐。策略或可用性已变化时返回 [Step0](step0-testcase_check.md) 重新分流。
 
 ## 2. 调用生成器
+
+每个 `api_full_name` 都是一个独立的测试目标。`database_api` 只用来查策略。
+
+独立使用本 skill 时，把第 1 节逐 API 准备好的输入交给生成器，继续执行下文“逐 API 交付”。
+
+### AI_LOOP 批量交接
+
+**准备清单。** 使用主控给的原始运行目录。命令里的 `--plan-step` 填主控计划中的步骤名，例如主控派发的是 `step1`，就填 `step1`。脚本按 `adapt-plan.<主控计划中的步骤名>.task-branches` 的派发顺序逐项核对 Step0 记录，只选出当前 `next_step=step0.1` 的 API。返修和续跑也按当前记录筛选。
+
+脚本会按本次运行的 venv 选取策略表，并为每个选中的 API 执行第 1 节的准备逻辑。
+
+```bash
+python3 <api-adaptation安装目录>/scripts/testcase_batch_handoff.py \
+  --run-dir <本次运行目录> --plan-step <主控计划中的步骤名> --database <数据库绝对路径> \
+  --write <本次尝试目录>/generator-input.json
+```
+
+**发送清单。** 命令成功且清单非空时，才调用生成器。把 `generator-input.json` 的绝对路径交给生成器作为本次输入，同时传入原始运行目录、主控计划中的步骤名、核对脚本的绝对路径，以及本轮执行要求或返修问题。
+
+**核对收件。** 生成器在写用例前，用实际收到的 JSON 执行下面的命令。沿用发送时的运行目录和主控计划中的步骤名。
+
+```bash
+python3 <核对脚本绝对路径> \
+  --run-dir <本次运行目录> --plan-step <主控计划中的步骤名> \
+  --received <实际收到的JSON绝对路径>
+```
+
+核对成功后，把输出的 API 数量和按顺序排列的全名保存到本次尝试目录的 `generator-received.json`。核对以 API 入口为单位，测试文件数不参与核对。发现缺项、多项、重复、改名或顺序不一致时，生成器交回差异，待发送方修正并重新交接后再核对。
+
+### 逐 API 交付
 
 读取并执行已安装的 `gen-torch-npu-api-ut/SKILL.md`，逐 API 交付以下内容。
 
@@ -72,10 +104,24 @@ python3 <api-adaptation安装目录>/scripts/npu_handoff.py snapshot \
   --test-file <测试文件> --output <本次尝试目录>/snapshot.json
 ```
 
+- 修复已进入过实现适配的用例时，若该项已有 `adaptation`，在快照命令中加 `--results <本次api-loop/result.json>`，把新证据绑定到当前方案。
 - `--test-file` 使用相对 torch_npu 源码仓的路径，多个文件重复传参。
 - 实际依赖的 helper 或数据通过 `--extra-path` 补充，脚本自动计入包的 `__init__.py`。
 
 ### 生成器执行、修复和保存报告
+
+逐文件执行 unittest。调用方沿用本轮 NPU 虚拟环境、选卡、分布式配置与超时。TEST_FILE 是仓内相对路径，LOG 是该文件本轮的原始日志路径。
+
+```bash
+if ASCEND_WORK_PATH="$ATTEMPT" RUN_SUPPLEMENT_API_TESTS=1 "$PYTHON" \
+  "$SKILL_DIR/scripts/run_npu_unittest.py" --source "$TORCH_NPU" \
+  --file "$TEST_FILE" --attempt "$ATTEMPT" >"$LOG" 2>&1; then rc=0; else rc=$?; fi
+printf '%s\n' "$rc" >"$LOG.exit"
+```
+
+每个文件的 `unittest/<仓内相对路径>/` 保存同次执行的 `junit.xml` 和 `execution-result.json`。沿用已有方式汇总原始日志、各文件退出码与 UT_REPORT.md。进程未启动或中途被终止时记录实际错误及退出码，只归档已生成的材料。
+
+报告工具使用 unittest-xml-reporting 和 lxml。若目标 Python 缺少 xmlrunner，用该 Python 的 `-m pip install --target <独立报告工具目录> unittest-xml-reporting` 安装，并以 NPU_JUNIT_TOOLS 指向该目录。离线机器使用与目标 Python 和架构匹配的 wheel。
 
 1. 每次运行（含重跑），将 `ATTEMPT` 指向本批运行目录下本次尝试目录的绝对路径。生成器加载指定环境后，以 `ASCEND_WORK_PATH="$ATTEMPT" RUN_SUPPLEMENT_API_TESTS=1` 启动指定 Python 测试进程，执行该 API 的全部测试，保存原始输出和退出码。环境及设备按 [NPU 验收条件](step1-testcase_validation.md#npu-验收条件) 核对。
 2. 生成器修正用例后，在新尝试目录重新保存快照并运行。Step1 明确要求修复重跑的项使用新结果，普通同批续跑可复用仍有效的报告。
@@ -89,7 +135,7 @@ Step0.1 根据退出码、原始日志和报告中的逐用例结果，确定实
 ```bash
 python3 <api-adaptation安装目录>/scripts/npu_handoff.py record \
   --source <torch_npu源码仓> --results <本次api-loop/result.json> \
-  --snapshot <本次尝试目录>/snapshot.json --execution <pass|fail|skip|partial|blocked> \
+  --require-junit --snapshot <本次尝试目录>/snapshot.json --execution <pass|fail|skip|partial|blocked> \
   --report <本次尝试目录内报告> --log <本次尝试目录内原始日志>
 ```
 

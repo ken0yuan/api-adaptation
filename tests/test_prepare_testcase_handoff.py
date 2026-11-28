@@ -57,6 +57,43 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(result['database_api'], 'Tensor.flatten')
         self.assertEqual(result['api_full_name'], 'torch.Tensor.flatten')
 
+    def test_batch_keeps_dispatched_names_for_nightly_and_releases(self):
+        import testcase_batch_handoff as batch
+
+        names = ['torch.nn.Fold.extra_repr', 'torch.nn.modules.fold.Fold.extra_repr']
+        self.insert(names[0], kind='框架类API')
+        self.insert(names[1], target=names[0])
+        with closing(sqlite3.connect(self.database)) as conn, conn:
+            for table in ('API支持数据_2.15', 'API支持数据_2.16'):
+                conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM "API支持数据"')
+        tasks = ['adapt-' + name for name in names]
+        run = self.database.parent
+        (run / 'api-loop').mkdir()
+        rows = [{'api': name, 'next_step': 'step0.1', 'generator_category': '框架类'} for name in names]
+        (run / 'api-loop/result.json').write_text(json.dumps({'results': rows}), encoding='utf-8')
+        manifest = run / 'input.json'
+        cli = [sys.executable, '-X', 'utf8', '-B', str(SCRIPT.with_name('testcase_batch_handoff.py')),
+               '--run-dir', str(run), '--plan-step', 'step1']
+        for prefix, table in [('', 'API支持数据'), ('torch-2.15.0/', 'API支持数据_2.15'),
+                              ('torch-2.16.1/', 'API支持数据_2.16')]:
+            basic = {'venv': f'data/venv/{prefix}python-3.11.17'}
+            (run / 'basic_information.json').write_text(json.dumps(basic), encoding='utf-8')
+            for assigned in [tasks[:1], tasks]:
+                with self.subTest(table=table, assigned=assigned):
+                    plan = {'step1': {'agentname': 'api-adaptation', 'task-branches': assigned}}
+                    (run / 'adapt-information.json').write_text(json.dumps({'adapt-plan': plan}), encoding='utf-8')
+                    subprocess.run(cli + ['--database', str(self.database), '--write', str(manifest)],
+                                   capture_output=True, check=True)
+                    items = json.loads(manifest.read_bytes())
+                    self.assertEqual([x['classification_source']['table'] for x in items], [table] * len(assigned))
+                    receipt = subprocess.check_output(cli + ['--received', str(manifest)])
+                    self.assertEqual(json.loads(receipt)['api_full_names'], names[:len(assigned)])
+            selected = batch.pending(run, 'step1')
+            for bad in [items[:1], items[::-1], [items[0], items[0]],
+                        [items[0], dict(items[1], api_full_name=names[0])]]:
+                with self.subTest(table=table, received=bad), self.assertRaises(ValueError):
+                    batch.verify(selected, bad)
+
     def test_distributed_api_receives_initial_database_category_before_generator_review(self):
         self.insert('torch.distributed.all_reduce', kind='框架类API')
         result = handoff.prepare(self.database, 'torch.distributed.all_reduce')
